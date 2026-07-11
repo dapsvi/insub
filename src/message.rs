@@ -30,7 +30,7 @@ impl Message {
             .ok_or("shared secret missing after computation")?;
 
         // 2. encryption
-        let (ciphertext, nonce) = cipher::encrypt(plaintext, shared_secret.as_slice())?;
+        let (ciphertext, nonce) = cipher::encrypt(plaintext.as_bytes(), shared_secret.as_slice())?;
 
         // 3. sign ciphertext, nonce and exchange_key
         let mut signed_data = Vec::with_capacity(ciphertext.len() + nonce.len() + 32);
@@ -73,7 +73,9 @@ impl Message {
             .ok_or("shared secret missing after computation")?;
 
         // 3. decryption
-        let decrypted_text = cipher::decrypt(&self.ciphertext, &self.nonce, shared_secret.as_slice())?;
+        let decrypted_bytes = cipher::decrypt(&self.ciphertext, &self.nonce, shared_secret.as_slice())?;
+        let decrypted_text = String::from_utf8(decrypted_bytes)
+            .map_err(|_| "decrypted data is not valid UTF-8")?;
 
         Ok(decrypted_text)
     }

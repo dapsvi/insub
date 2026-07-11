@@ -13,29 +13,28 @@ fn compute_cipher(shared_secret: &[u8], salt: Option<&[u8]>) -> Result<ChaCha20P
     Ok(cipher)
 }
 
-// encrypt the text using the shared secret
-pub fn encrypt(plaintext: &str, shared_secret: &[u8]) -> Result<(Vec<u8>, [u8; 12]), &'static str> {
+// encrypt the bytes using the shared secret
+pub fn encrypt(bytes: &[u8], shared_secret: &[u8]) -> Result<(Vec<u8>, [u8; 12]), &'static str> {
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from(nonce_bytes); // idfk why we need that but otherwise it's not safe -> to be reviewed
+    let nonce = Nonce::from(nonce_bytes); // no idea why we need that but otherwise it's not secure -> to be reviewed
 
     let cipher = compute_cipher(shared_secret, Some(b"cipher-salt"))?;
 
-    let ciphertext = cipher.encrypt(&nonce, plaintext.as_bytes())
+    let ciphertext = cipher.encrypt(&nonce, bytes)
         .map_err(|_| "encryption failed")?;
 
     Ok((ciphertext, nonce_bytes))
 }
 
-// decrypt the text using the shared secret and the nonce
-pub fn decrypt(ciphertext: &[u8], nonce_bytes: &[u8; 12], shared_secret: &[u8]) -> Result<String, &'static str> {
+// decrypt the bytes using the shared secret and the nonce
+pub fn decrypt(cipher_bytes: &[u8], nonce_bytes: &[u8; 12], shared_secret: &[u8]) -> Result<Vec<u8>, &'static str> {
     let nonce = Nonce::from(*nonce_bytes);
 
     let cipher = compute_cipher(shared_secret, Some(b"cipher-salt"))?;
 
-    let plaintext_bytes = cipher.decrypt(&nonce, ciphertext)
+    let decrypted_bytes = cipher.decrypt(&nonce, cipher_bytes)
         .map_err(|_| "decryption failed: wrong key, wrong nonce, or corrupted/tampered data")?;
 
-    String::from_utf8(plaintext_bytes)
-        .map_err(|_| "decrypted data is not valid UTF-8")
+    Ok(decrypted_bytes)
 }
