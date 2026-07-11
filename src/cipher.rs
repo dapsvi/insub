@@ -3,6 +3,7 @@ use hkdf::Hkdf;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
 use rand_core::{RngCore, OsRng};
 
+// helper function that returns a cipher for encrypting and decrypting based on a pre-computed shared secret
 fn compute_cipher(shared_secret: &[u8], salt: Option<&[u8]>) -> Result<ChaCha20Poly1305, &'static str> {
     let hk = Hkdf::<Sha256>::new(salt, shared_secret);
     let mut key = [0u8; 32];
@@ -12,10 +13,11 @@ fn compute_cipher(shared_secret: &[u8], salt: Option<&[u8]>) -> Result<ChaCha20P
     Ok(cipher)
 }
 
+// encrypt the text using the shared secret
 pub fn encrypt(plaintext: &str, shared_secret: &[u8]) -> Result<(Vec<u8>, [u8; 12]), &'static str> {
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from(nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes); // idfk why we need that but otherwise it's not safe -> to be reviewed
 
     let cipher = compute_cipher(shared_secret, Some(b"cipher-salt"))?;
 
@@ -25,6 +27,7 @@ pub fn encrypt(plaintext: &str, shared_secret: &[u8]) -> Result<(Vec<u8>, [u8; 1
     Ok((ciphertext, nonce_bytes))
 }
 
+// decrypt the text using the shared secret and the nonce
 pub fn decrypt(ciphertext: &[u8], nonce_bytes: &[u8; 12], shared_secret: &[u8]) -> Result<String, &'static str> {
     let nonce = Nonce::from(*nonce_bytes);
 

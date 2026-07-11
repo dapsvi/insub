@@ -6,6 +6,7 @@ use crate::identity::{MasterKeyPair, UserID};
 use crate::exchange::EphemeralExchangeKeyPair;
 use crate::cipher;
 
+// struct containing all the data that will be sent over the network to send a message
 pub struct Message {
     pub sender_identity: VerifyingKey,
     pub exchange_key: PublicKey,
