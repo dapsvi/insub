@@ -1,5 +1,3 @@
-use std::ops::Not;
-
 use x25519_dalek::PublicKey;
 use ed25519_dalek::{Signature, VerifyingKey};
 use crate::identity::{MasterKeyPair, UserID};
@@ -78,5 +76,60 @@ impl Message {
             .map_err(|_| "decrypted data is not valid UTF-8")?;
 
         Ok(decrypted_text)
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, &'static str> {
+        // serialization will store the message in this order :
+        // 1. sender_identity (32 bytes)
+        // 2. exchange_key    (32 bytes)
+        // 3. nonce           (12 bytes)
+        // 4. signature       (64 bytes)
+        // 5. ciphertext      (rest of the array)
+        let total_length = 32 + 32 + 12 + 64 + self.ciphertext.len();
+        let mut serialized = Vec::with_capacity(total_length);
+        serialized.extend_from_slice(&self.sender_identity.to_bytes());
+        serialized.extend_from_slice(&self.exchange_key.to_bytes());
+        serialized.extend_from_slice(&self.nonce);
+        serialized.extend_from_slice(&self.signature.to_bytes());
+        serialized.extend_from_slice(&self.ciphertext);
+        Ok(serialized)
+    }
+
+    pub fn from_serialized(mut serialized: Vec<u8>) -> Result<Message, &'static str> {
+        // cf self.serialize()
+        let sender_identity_bytes: [u8; 32] = serialized.drain(0..32)
+            .collect::<Vec<u8>>()
+            .try_into()
+            .map_err(|_| "Failed to parse sender identity key")?;
+        let sender_identity = VerifyingKey::from_bytes(&sender_identity_bytes)
+            .map_err(|_| "Failed to create VerifyingKey object")?;
+
+        let exchange_key_bytes: [u8; 32] = serialized.drain(0..32)
+            .collect::<Vec<u8>>()
+            .try_into()
+            .map_err(|_| "Failed to parse exchange key")?;
+        let exchange_key = PublicKey::try_from(exchange_key_bytes)
+            .map_err(|_| "Failed to create PublicKey object")?;
+
+        let nonce: [u8; 12] = serialized.drain(0..12)
+            .collect::<Vec<u8>>()
+            .try_into()
+            .map_err(|_| "Failed to parse nonce")?;
+
+        let signature_bytes: [u8; 64] = serialized.drain(0..64)
+            .collect::<Vec<u8>>()
+            .try_into()
+            .map_err(|_| "Failed to parse signature")?;
+        let signature = Signature::from_bytes(&signature_bytes);
+
+        let ciphertext = serialized;
+
+        Ok(Message {
+            sender_identity,
+            exchange_key,
+            nonce,
+            ciphertext,
+            signature
+        })
     }
 }
