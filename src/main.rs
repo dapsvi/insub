@@ -1,11 +1,9 @@
-mod identity;
-mod exchange;
-mod cipher;
-mod message;
+pub mod crypto;
+pub mod protocol;
+pub mod identity;
 
-use identity::{MasterKeyPair, UserID};
-use exchange::EphemeralExchangeKeyPair;
-use message::Message;
+use crypto::identity::{MasterKeyPair, UserID};
+use crypto::exchange::EphemeralExchangeKeyPair;
 
 // little tests
 fn main() {

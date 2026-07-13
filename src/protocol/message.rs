@@ -1,8 +1,8 @@
 use x25519_dalek::PublicKey;
 use ed25519_dalek::{Signature, VerifyingKey};
-use crate::identity::{MasterKeyPair, UserID};
-use crate::exchange::EphemeralExchangeKeyPair;
-use crate::cipher;
+use crate::crypto::identity::{MasterKeyPair, UserID};
+use crate::crypto::exchange::EphemeralExchangeKeyPair;
+use crate::crypto::cipher;
 
 // struct containing all the data that will be sent over the network to send a message
 pub struct Message {

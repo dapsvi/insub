@@ -24,9 +24,10 @@ impl StaticExchangeKeyPair {
     }
 
     // compute the shared secret using the Diffie-Hellman algorithm
-    pub fn compute_shared_secret(&mut self, peer_public_key: &PublicKey) {
+    pub fn compute_shared_secret(&mut self, peer_public_key: &PublicKey) -> Result<(), &'static str> {
         let shared_secret = self.secret.diffie_hellman(peer_public_key);
         self.shared_secret = Some(Zeroizing::new(*shared_secret.as_bytes()));
+        Ok(())
     }
 }
 
