@@ -1,135 +1,77 @@
-use x25519_dalek::PublicKey;
-use ed25519_dalek::{Signature, VerifyingKey};
-use crate::crypto::identity::{MasterKeyPair, UserID};
-use crate::crypto::exchange::EphemeralExchangeKeyPair;
-use crate::crypto::cipher;
+use rand::RngExt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-// struct containing all the data that will be sent over the network to send a message
+fn generate_id() -> u128 {
+    rand::rng().random()
+}
+
+fn now_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+// struct containing all the data that a message contains
 pub struct Message {
-    pub sender_identity: VerifyingKey,
-    pub exchange_key: PublicKey,
-    pub nonce: [u8; 12],
-    pub ciphertext: Vec<u8>,
-    pub signature: Signature,
+    pub id: u128,
+    pub content: String,
+    pub timestamp: u64,
+    pub reply_to: Option<u128>,
 }
 
 impl Message {
-    pub fn new(
-        sender: &MasterKeyPair,
-        sender_exchange: &mut EphemeralExchangeKeyPair,
-        recipient_exchange_pubkey: &PublicKey,
-        plaintext: &str,
-    ) -> Result<Message, &'static str> {
-        // 1. compute the shared secret
-        sender_exchange.compute_shared_secret(recipient_exchange_pubkey)?;
-        let shared_secret = sender_exchange
-            .shared_secret
-            .as_ref()
-            .ok_or("shared secret missing after computation")?;
+    pub fn new(content: String, reply_to: Option<u128>) -> Message {
+        let id = generate_id();
+        let timestamp = now_timestamp();
 
-        // 2. encryption
-        let (ciphertext, nonce) = cipher::encrypt(plaintext.as_bytes(), shared_secret.as_slice())?;
-
-        // 3. sign ciphertext, nonce and exchange_key
-        let mut signed_data = Vec::with_capacity(ciphertext.len() + nonce.len() + 32);
-        signed_data.extend_from_slice(&ciphertext);
-        signed_data.extend_from_slice(&nonce);
-        signed_data.extend_from_slice(sender_exchange.public_key.as_bytes());
-
-        let signature = sender.sign(&signed_data);
-
-        Ok(Message {
-            sender_identity: sender.public_key,
-            exchange_key: sender_exchange.public_key,
-            nonce,
-            ciphertext,
-            signature,
-        })
-    }
-
-    pub fn open(
-        &self,
-        recipient_exchange: &mut EphemeralExchangeKeyPair,
-        sender_identity: &UserID,
-    ) -> Result<String, &'static str> {
-        // 1. verify signature
-        let mut signed_data = Vec::with_capacity(self.ciphertext.len() + self.nonce.len() + 32);
-        signed_data.extend_from_slice(&self.ciphertext);
-        signed_data.extend_from_slice(&self.nonce);
-        signed_data.extend_from_slice(self.exchange_key.as_bytes());
-        
-        let is_signature_valid = sender_identity.verify(&signed_data, &self.signature);
-        if !is_signature_valid {
-            return Err("The signature does not match");
-        }
-        
-        // 2. compute shared secret
-        recipient_exchange.compute_shared_secret(&self.exchange_key)?;
-        let shared_secret = recipient_exchange
-            .shared_secret
-            .as_ref()
-            .ok_or("shared secret missing after computation")?;
-
-        // 3. decryption
-        let decrypted_bytes = cipher::decrypt(&self.ciphertext, &self.nonce, shared_secret.as_slice())?;
-        let decrypted_text = String::from_utf8(decrypted_bytes)
-            .map_err(|_| "decrypted data is not valid UTF-8")?;
-
-        Ok(decrypted_text)
+        Message { id, content, timestamp, reply_to }
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, &'static str> {
         // serialization will store the message in this order :
-        // 1. sender_identity (32 bytes)
-        // 2. exchange_key    (32 bytes)
-        // 3. nonce           (12 bytes)
-        // 4. signature       (64 bytes)
-        // 5. ciphertext      (rest of the array)
-        let total_length = 32 + 32 + 12 + 64 + self.ciphertext.len();
+        // 1. id                (128 bits = 16 bytes)
+        // 2. timestamp         (64 bits = 8 bytes)
+        // 3. reply_to          (128 bits = 16 bytes)
+        // 5. content           (rest of the array)
+        let total_length = 16 + 8 + 16 + self.content.as_bytes().len();
         let mut serialized = Vec::with_capacity(total_length);
-        serialized.extend_from_slice(&self.sender_identity.to_bytes());
-        serialized.extend_from_slice(&self.exchange_key.to_bytes());
-        serialized.extend_from_slice(&self.nonce);
-        serialized.extend_from_slice(&self.signature.to_bytes());
-        serialized.extend_from_slice(&self.ciphertext);
+        serialized.extend_from_slice(&self.id.to_be_bytes());
+        serialized.extend_from_slice(&self.timestamp.to_be_bytes());
+        serialized.extend_from_slice(&self.reply_to.unwrap_or(0).to_be_bytes());
+        serialized.extend_from_slice(&self.content.as_bytes());
         Ok(serialized)
     }
 
     pub fn from_serialized(mut serialized: Vec<u8>) -> Result<Message, &'static str> {
         // cf self.serialize()
-        let sender_identity_bytes: [u8; 32] = serialized.drain(0..32)
+        let id_bytes = serialized.drain(0..16)
             .collect::<Vec<u8>>()
             .try_into()
-            .map_err(|_| "Failed to parse sender identity key")?;
-        let sender_identity = VerifyingKey::from_bytes(&sender_identity_bytes)
-            .map_err(|_| "Failed to create VerifyingKey object")?;
+            .map_err(|_| "Failed to parse message ID")?;
+        let id = u128::from_be_bytes(id_bytes);
 
-        let exchange_key_bytes: [u8; 32] = serialized.drain(0..32)
+        let timestamp_bytes = serialized.drain(0..8)
             .collect::<Vec<u8>>()
             .try_into()
-            .map_err(|_| "Failed to parse exchange key")?;
-        let exchange_key = PublicKey::try_from(exchange_key_bytes)
-            .map_err(|_| "Failed to create PublicKey object")?;
+            .map_err(|_| "Failed to parse message timestamp")?;
+        let timestamp = u64::from_be_bytes(timestamp_bytes);
 
-        let nonce: [u8; 12] = serialized.drain(0..12)
+        let reply_to_bytes = serialized.drain(0..16)
             .collect::<Vec<u8>>()
             .try_into()
-            .map_err(|_| "Failed to parse nonce")?;
+            .map_err(|_| "Failed to parse message reply")?;
+        let reply_to = u128::from_be_bytes(reply_to_bytes);
+        let reply_to = if reply_to == 0 {
+            None
+        } else {
+            Some(reply_to)
+        };
 
-        let signature_bytes: [u8; 64] = serialized.drain(0..64)
-            .collect::<Vec<u8>>()
-            .try_into()
-            .map_err(|_| "Failed to parse signature")?;
-        let signature = Signature::from_bytes(&signature_bytes);
+        let content_bytes = serialized;
+        let content = String::from_utf8(content_bytes)
+            .map_err(|_| "invalid UTF-8 in message content")?;
 
-        let ciphertext = serialized;
-
-        Ok(Message {
-            sender_identity,
-            exchange_key,
-            nonce,
-            ciphertext,
-            signature
-        })
+        Ok(Message { id, content, timestamp, reply_to })
     }
 }

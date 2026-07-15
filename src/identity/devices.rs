@@ -1,7 +1,7 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::identity::certificates::DeviceCertificate;
-use crate::crypto::identity::{UserID, MasterKeyPair};
+use crate::identity::identity::{UserID, MasterKeyPair};
 
 const MAX_DEVICES: usize = 5;
 

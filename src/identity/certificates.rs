@@ -1,7 +1,7 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use x25519_dalek::PublicKey;
 
-use crate::crypto::identity::{MasterKeyPair, UserID};
+use crate::identity::identity::{MasterKeyPair, UserID};
 
 pub struct DeviceCertificate {
     pub device_ed25519_pubkey: VerifyingKey,
