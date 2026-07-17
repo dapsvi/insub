@@ -69,6 +69,11 @@ impl Session {
             self.our_ratchet_dh_priv.unwrap(),
             their_ratchet_pub,
         ));
+        self.ratchet
+            .as_mut()
+            .ok_or("Ratchet not initialized properly")?
+            .initiator_pre_ratchet();
+
         self.handshake_hash = Some(result.handshake_hash);
         self.remote_static = Some(result.remote_static);
         Ok(())
@@ -124,6 +129,7 @@ impl Session {
             self.our_ratchet_dh_priv.unwrap(),
             self.their_ratchet_dh_pub.unwrap(),
         ));
+        // responder does NOT call initiator_pre_ratchet: its first decrypt() triggers dh_ratchet_step, which catches up via DH commutativity and also prepares the sending chain for the reply
         self.handshake_hash = Some(result.handshake_hash);
         self.remote_static = Some(result.remote_static);
         Ok(outgoing_message)

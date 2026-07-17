@@ -2,6 +2,8 @@ use bip39::{Mnemonic, Language};
 use ed25519_dalek::{Signer, Verifier, SigningKey, VerifyingKey};
 use zeroize::Zeroize;
 
+use crate::crypto::hkdf::derive_key;
+
 // key pair used to sign messages (for now)
 pub struct MasterKeyPair {
     pub public_key: VerifyingKey,
@@ -12,8 +14,8 @@ impl MasterKeyPair {
     // allows to create a pair based on a seed phrase (like cryptocurrencies)
     pub fn from_mnemonic(mnemonic: &Mnemonic, password: Option<&str>) -> Self {
         let mut seed_64 = mnemonic.to_seed(password.unwrap_or(""));
-        let mut seed_32 = [0u8; 32];
-        seed_32.copy_from_slice(&seed_64[..32]);
+        let mut seed_32 = derive_key(&seed_64, None, b"insub-master-ed25519-v1")
+            .expect("HKDF key derivation failed");
         let private_key = SigningKey::from_bytes(&seed_32);
         let public_key = private_key.verifying_key();
 
