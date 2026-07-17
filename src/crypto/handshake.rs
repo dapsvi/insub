@@ -14,6 +14,7 @@ pub struct HandshakeResult {
     pub transport: TransportState,
     pub handshake_hash: [u8; 32],
     pub remote_static: [u8; 32],
+    pub peer_ratchet_pub: Vec<u8>,
 }
 
 impl Initiator {
@@ -45,7 +46,7 @@ impl Initiator {
     }
 
     /// build the first handshake message to send to the responder
-    pub fn initiate(&mut self) -> Result<Vec<u8>, String> {
+    pub fn initiate(&mut self, payload: Vec<u8>) -> Result<Vec<u8>, String> {
         let handshake = self
             .handshake
             .as_mut()
@@ -53,7 +54,7 @@ impl Initiator {
 
         let mut outgoing_message = vec![0u8; 1024];
         let written = handshake
-            .write_message(&[], &mut outgoing_message)
+            .write_message(&payload, &mut outgoing_message)
             .map_err(|e| format!("handshake initiation failed: {e}"))?;
         outgoing_message.truncate(written);
         Ok(outgoing_message)
@@ -66,9 +67,11 @@ impl Initiator {
             .take()
             .ok_or("handshake already completed")?;
 
-        handshake
-            .read_message(response, &mut [])
+        let mut peer_ratchet_pub = vec![0u8; 1024];
+        let written = handshake
+            .read_message(response, &mut peer_ratchet_pub)
             .map_err(|e| format!("handshake response failed: {e}"))?;
+        peer_ratchet_pub.truncate(written);
 
         let handshake_hash = copy_handshake_hash(&handshake);
 
@@ -86,6 +89,7 @@ impl Initiator {
             transport,
             handshake_hash,
             remote_static,
+            peer_ratchet_pub,
         })
     }
 }
@@ -115,20 +119,22 @@ impl Responder {
     }
 
     // process the first handshake message from an initiator
-    pub fn accept(&mut self, incoming_message: &[u8]) -> Result<(), String> {
+    pub fn accept(&mut self, incoming_message: &[u8]) -> Result<Vec<u8>, String> {
         let handshake = self
             .handshake
             .as_mut()
             .ok_or("handshake already completed")?;
 
-        handshake
-            .read_message(incoming_message, &mut [])
+        let mut payload = vec![0u8; 1024];
+        let written = handshake
+            .read_message(incoming_message, &mut payload)
             .map_err(|e| format!("handshake accept failed: {e}"))?;
-        Ok(())
+        payload.truncate(written);
+        Ok(payload)
     }
 
     // build the second/final handshake message and finish
-    pub fn reply(&mut self) -> Result<(Vec<u8>, HandshakeResult), String> {
+    pub fn reply(&mut self, payload: Vec<u8>) -> Result<(Vec<u8>, HandshakeResult), String> {
         let mut handshake = self
             .handshake
             .take()
@@ -136,7 +142,7 @@ impl Responder {
 
         let mut outgoing_message = vec![0u8; 1024];
         let written_length = handshake
-            .write_message(&[], &mut outgoing_message)
+            .write_message(&payload, &mut outgoing_message)
             .map_err(|e| format!("handshake reply failed: {e}"))?;
         outgoing_message.truncate(written_length);
 
@@ -158,6 +164,7 @@ impl Responder {
                 transport,
                 handshake_hash,
                 remote_static,
+                peer_ratchet_pub: Vec::new(),
             },
         ))
     }

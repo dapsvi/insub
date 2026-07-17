@@ -1,7 +1,7 @@
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-// struct holding a static (reusable) key pair for exchanging data (unused yet)
+// struct holding a static (reusable) key pair for exchanging data
 pub struct StaticExchangeKeyPair {
     pub public_key: PublicKey,
     secret: StaticSecret,
