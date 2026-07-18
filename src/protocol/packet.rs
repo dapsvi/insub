@@ -1,30 +1,34 @@
 pub enum PacketFlag {
-    AckRequired,        // 0x1
-    Ack,                // 0x2
-    Fragmented,         // 0x4
-    LastFragment,       // 0x8
+    AckRequired,        // 0x01
+    Ack,                // 0x02
+    Fragmented,         // 0x04
+    LastFragment,       // 0x08
+    Handshake,          // 0x10
+    Relay,              // 0x20
 }
 
-pub fn flag_to_int(flag: PacketFlag) -> u16 {
-    let int: u16 = match flag {
-        PacketFlag::AckRequired     => 0b0001,
-        PacketFlag::Ack             => 0b0010,
-        PacketFlag::Fragmented      => 0b0100,
-        PacketFlag::LastFragment    => 0b1000,
+pub fn flag_to_int(flag: PacketFlag) -> u32 {
+    let int: u32 = match flag {
+        PacketFlag::AckRequired     => 0b00000001,
+        PacketFlag::Ack             => 0b00000010,
+        PacketFlag::Fragmented      => 0b00000100,
+        PacketFlag::LastFragment    => 0b00001000,
+        PacketFlag::Handshake       => 0b00010000,
+        PacketFlag::Relay           => 0b00100000,
     };
     int
 }
 
 pub struct PacketFlags {
-    pub flags: u16,
+    pub flags: u32,
 }
 
 impl PacketFlags {
-    pub fn to_int(&self) -> u16 {
+    pub fn to_int(&self) -> u32 {
         self.flags
     }
 
-    pub fn from_int(flags: u16) -> PacketFlags {
+    pub fn from_int(flags: u32) -> PacketFlags {
         PacketFlags { flags }
     }
 
@@ -50,7 +54,7 @@ pub struct Packet {
 }
 
 impl Packet {
-    pub fn new(version: u64, flags: u16, id: u128, nonce: [u8; 12], payload: Vec<u8>) -> Packet {
+    pub fn new(version: u64, flags: u32, id: u128, nonce: [u8; 12], payload: Vec<u8>) -> Packet {
         let header = PacketHeader{
             version,
             flags: PacketFlags { flags },
@@ -67,11 +71,11 @@ impl Packet {
     pub fn serialize(&self) -> Vec<u8> {
         // serialization will store the packet in this order :
         // 1. version           (64 bits = 8 bytes)
-        // 2. flags             (16 bits = 2 bytes)
+        // 2. flags             (32 bits = 4 bytes)
         // 3. id                (128 bits = 16 bytes)
         // 4. nonce             (12 bytes)
         // 5. payload           (rest of the vector)
-        let total_length = 8 + 2 + 16 + 12 + self.payload.len();
+        let total_length = 8 + 4 + 16 + 12 + self.payload.len();
         let mut serialized = Vec::with_capacity(total_length);
 
         serialized.extend_from_slice(&self.header.version.to_be_bytes());
@@ -90,11 +94,11 @@ impl Packet {
             .map_err(|_| "Failed to parse packet version")?;
         let version = u64::from_be_bytes(version_bytes);
 
-        let flags_bytes = serialized.drain(0..2)
+        let flags_bytes = serialized.drain(0..4)
             .collect::<Vec<u8>>()
             .try_into()
             .map_err(|_| "Failed to parse packet flags")?;
-        let flags = u16::from_be_bytes(flags_bytes);
+        let flags = u32::from_be_bytes(flags_bytes);
 
         let id_bytes = serialized.drain(0..16)
             .collect::<Vec<u8>>()

@@ -2,15 +2,13 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use sha2::{Digest, Sha256};
 
-use crate::relay;
-
 pub struct RelayEntry {
     pub id: u128,
     pub pubkey: [u8; 32],
     pub address: SocketAddr,
 }
 
-fn derive_id(pubkey: &[u8; 32]) -> u128 {
+pub fn derive_id(pubkey: &[u8; 32]) -> u128 {
     let mut hasher = Sha256::new();
     hasher.update(pubkey);
     hasher.update("relay_id");
@@ -115,6 +113,12 @@ pub struct RelayRegistry {
 }
 
 impl RelayRegistry {
+    pub fn new() -> Self {
+        RelayRegistry {
+            registry: Vec::new(),
+        }
+    }
+
     pub fn add(&mut self, entry: RelayEntry) {
         self.registry.push(entry);
     }
@@ -165,4 +169,22 @@ impl RelayRegistry {
 pub struct RelayAnnouncement {
     signature: [u8; 64],
     entry: RelayEntry,
+}
+
+pub struct PeerId {
+    pub id: u128,
+}
+
+impl PeerId {
+    pub fn from_master_pubkey(pubkey: &[u8; 32]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(pubkey);
+        hasher.update(b"peer_id");
+
+        let result = hasher.finalize();
+        let id_bytes: [u8; 16] = result[..16].try_into().unwrap();
+        let id = u128::from_be_bytes(id_bytes);
+
+        PeerId { id }
+    }
 }
