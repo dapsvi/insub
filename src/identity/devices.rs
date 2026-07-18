@@ -128,7 +128,7 @@ impl DeviceList {
             .ok_or("Unknown certificate")?;
 
         self.sequence += 1;
-        self.devices.swap_remove(position);
+        self.devices.remove(position);
         self.master_signature = Self::sign_data(self.sequence, &self.devices, master);
 
         Ok(())
