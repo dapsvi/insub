@@ -1,10 +1,12 @@
+use std::net::SocketAddr;
+
 use crate::dht::node_id::NodeID;
 
 const K: usize = 20;
 
 pub struct RoutingTable {
     local_id: NodeID,
-    buckets: Vec<Vec<NodeID>>,  // 256 buckets, one per bit position
+    buckets: Vec<Vec<(NodeID, SocketAddr)>>,
 }
 
 impl RoutingTable {
@@ -22,33 +24,31 @@ impl RoutingTable {
             .unwrap_or(255)
     }
 
-    pub fn add_node(&mut self, node: NodeID) {
+    pub fn add_node(&mut self, node: NodeID, addr: SocketAddr) {
         if node == self.local_id {
             return;
         }
         let bucket_index = self.bucket(&node);
         let bucket = &mut self.buckets[bucket_index];
 
-        // if already present, move to tail (most recently seen)
-        if let Some(pos) = bucket.iter().position(|n| *n == node) {
+        if let Some(pos) = bucket.iter().position(|(n, _)| *n == node) {
             bucket.remove(pos);
-            bucket.push(node);
+            bucket.push((node, addr));
             return;
         }
 
         if bucket.len() < K {
-            bucket.push(node);
+            bucket.push((node, addr));
         }
-        // else: bucket full -> test oldest node                // TODO
     }
 
     pub fn remove_node(&mut self, node: &NodeID) {
         let bucket_index = self.bucket(node);
         self.buckets[bucket_index]
-            .retain(|iter_node| *iter_node != *node);
+            .retain(|(n, _)| *n != *node);
     }
 
-    pub fn closest_nodes(&self, target: &NodeID, n: usize) -> Vec<NodeID> {
+    pub fn closest_nodes(&self, target: &NodeID, n: usize) -> Vec<(NodeID, SocketAddr)> {
         let mut candidates = Vec::new();
         let start = self.bucket(target);
 
@@ -67,9 +67,9 @@ impl RoutingTable {
             }
         }
 
-        candidates.sort_by_key(|node| {
+        candidates.sort_by_key(|(node, _)| {
             let dist = target.distance(node);
-            dist.to_vec() // sort by distance bytes lexicographically
+            dist.to_vec()
         });
         candidates.truncate(n);
         candidates

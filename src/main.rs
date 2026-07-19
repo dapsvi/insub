@@ -6,10 +6,12 @@ pub mod network;
 pub mod dht;
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
 use identity::identity::MasterKeyPair;
+use identity::keychain::Keychain;
 use network::relay::RelayNode;
 use network::registry::{self, RelayEntry, RelayRegistry};
 use network::relay::RelayFrame;
@@ -21,7 +23,6 @@ use rand::RngExt;
 use transport::udp::UdpTransport;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-// Wrap an inner Packet inside a RelayFrame inside a Packet with RelayFrame payload
 fn relay_wrap(dest_id: u128, inner_packet: &Packet) -> Packet {
     let frame = RelayFrame::new(dest_id, inner_packet.serialize());
     let payload = Payload::new(PayloadTag::RelayFrame, frame.serialize());
@@ -29,14 +30,22 @@ fn relay_wrap(dest_id: u128, inner_packet: &Packet) -> Packet {
 }
 
 fn main() {
-    // ----- identities -----
+    let password = Some("test-password");
+
+    // ----- identities (master keys) -----
     let (alice_master, _) = MasterKeyPair::new();
     let (bob_master, _) = MasterKeyPair::new();
 
-    // ----- device X25519 static keys -----
-    let alice_device = StaticSecret::random();
-    let bob_device = StaticSecret::random();
-    let bob_device_pub = PublicKey::from(&bob_device);
+    // ----- device keychains -----
+    let (_, alice_mnemonic) = Keychain::new(Path::new("/tmp/insub-alice.keychain"), password).unwrap();
+    let alice_keychain = Keychain::load(Path::new("/tmp/insub-alice.keychain"), password).unwrap();
+    println!("[alice] device mnemonic: {}", alice_mnemonic);
+
+    let (_, bob_mnemonic) = Keychain::new(Path::new("/tmp/insub-bob.keychain"), password).unwrap();
+    let bob_keychain = Keychain::load(Path::new("/tmp/insub-bob.keychain"), password).unwrap();
+    println!("[bob] device mnemonic: {}", bob_mnemonic);
+
+    let bob_device_pub = PublicKey::from(&StaticSecret::from(bob_keychain.device_x25519_priv));
 
     // ----- relay IDs -----
     let alice_id = registry::derive_id(&alice_master.public_key.to_bytes());
@@ -64,30 +73,26 @@ fn main() {
     let alice_thread = thread::spawn(move || {
         let udp = UdpTransport::bind(alice_addr).unwrap();
         let mut session = Session::new_initiator(
-            alice_device.as_bytes(),
+            &alice_keychain.device_x25519_priv,
             bob_device_pub.as_bytes(),
         )
         .unwrap();
 
-        // handshake msg1 wrapped as Handshake payload inside RelayFrame
         let msg1 = session.initiate_handshake().unwrap();
         let handshake_payload = Payload::new(PayloadTag::Handshake, msg1);
         let handshake_pkt = Packet::new(1, 0, rand::rng().random(), [0u8; 12], handshake_payload);
         udp.send_to(&relay_wrap(bob_id, &handshake_pkt), relay_addr)
             .unwrap();
 
-        // relay forwards the inner Packet — check the Handshake payload
         let (resp_pkt, _) = udp.recv_from().unwrap();
         session.complete_handshake(&resp_pkt.payload.data).unwrap();
         println!("[alice] handshake complete");
 
-        // message
         let msg = Message::new("hello from alice through the relay".to_string(), None);
         let msg_pkt = session.send(&msg).unwrap();
         udp.send_to(&relay_wrap(bob_id, &msg_pkt), relay_addr)
             .unwrap();
 
-        // receive reply
         let (reply_pkt, _) = udp.recv_from().unwrap();
         let reply = session.receive(&reply_pkt).unwrap();
         println!("[alice] received: {}", reply.content);
@@ -97,9 +102,8 @@ fn main() {
     // ----- bob thread -----
     let bob_thread = thread::spawn(move || {
         let udp = UdpTransport::bind(bob_addr).unwrap();
-        let mut session = Session::new_responder(bob_device.as_bytes()).unwrap();
+        let mut session = Session::new_responder(&bob_keychain.device_x25519_priv).unwrap();
 
-        // receive handshake — relay forwarded the inner Packet
         let (msg1_pkt, _) = udp.recv_from().unwrap();
         session.accept_handshake(&msg1_pkt.payload.data).unwrap();
 
@@ -110,12 +114,10 @@ fn main() {
             .unwrap();
         println!("[bob] handshake complete");
 
-        // receive message
         let (msg_pkt, _) = udp.recv_from().unwrap();
         let received = session.receive(&msg_pkt).unwrap();
         println!("[bob] received: {}", received.content);
 
-        // reply
         let reply = Message::new(
             "got it through the relay".to_string(),
             Some(received.id),

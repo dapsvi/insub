@@ -4,7 +4,7 @@ use zeroize::Zeroize;
 
 use crate::crypto::hkdf::derive_key;
 
-// key pair used to sign messages (for now)
+// key pair used to sign device certificates
 pub struct MasterKeyPair {
     pub public_key: VerifyingKey,
     private_key: SigningKey,

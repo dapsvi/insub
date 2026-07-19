@@ -10,11 +10,25 @@ pub enum DhtOperation {
     FindNode { sender_id: NodeID, target_id: NodeID },
     Nodes { sender_id: NodeID, nodes: Vec<(NodeID, SocketAddr)> },
     Store { sender_id: NodeID, key: [u8; 32], value: Vec<u8>, ttl_seconds: u32 },
+    StoreAck { sender_id: NodeID, key: [u8; 32] },
     FindValue { sender_id: NodeID, key: [u8; 32] },
     Value { sender_id: NodeID, key: [u8; 32], value: Option<Vec<u8>>, closest_nodes: Vec<(NodeID, SocketAddr)> },
 }
 
 impl DhtOperation {
+    pub fn sender_id(&self) -> NodeID {
+        match self {
+            Self::Ping { sender_id, .. } => *sender_id,
+            Self::Pong { sender_id, .. } => *sender_id,
+            Self::FindNode { sender_id, .. } => *sender_id,
+            Self::Nodes { sender_id, .. } => *sender_id,
+            Self::Store { sender_id, .. } => *sender_id,
+            Self::StoreAck { sender_id, .. } => *sender_id,
+            Self::FindValue { sender_id, .. } => *sender_id,
+            Self::Value { sender_id, .. } => *sender_id,
+        }
+    }
+
     fn tag(&self) -> u8 {
         match self {
             DhtOperation::Ping { .. }       => 1,
@@ -22,8 +36,9 @@ impl DhtOperation {
             DhtOperation::FindNode { .. }   => 3,
             DhtOperation::Nodes { .. }      => 4,
             DhtOperation::Store { .. }      => 5,
-            DhtOperation::FindValue { .. }  => 6,
-            DhtOperation::Value { .. }      => 7,
+            DhtOperation::StoreAck { .. }   => 6,
+            DhtOperation::FindValue { .. }  => 7,
+            DhtOperation::Value { .. }      => 8,
         }
     }
 
@@ -123,6 +138,10 @@ impl DhtOperation {
                 buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
                 buf.extend_from_slice(value);
             }
+            DhtOperation::StoreAck { sender_id, key } => {
+                buf.extend_from_slice(&sender_id.id);
+                buf.extend_from_slice(key);
+            }
             DhtOperation::FindValue { sender_id, key } => {
                 buf.extend_from_slice(&sender_id.id);
                 buf.extend_from_slice(key);
@@ -189,9 +208,14 @@ impl DhtOperation {
             6 => {
                 let sender_id = read_id(&mut bytes)?;
                 let key = read_key(&mut bytes)?;
-                Ok(DhtOperation::FindValue { sender_id, key })
+                Ok(DhtOperation::StoreAck { sender_id, key })
             }
             7 => {
+                let sender_id = read_id(&mut bytes)?;
+                let key = read_key(&mut bytes)?;
+                Ok(DhtOperation::FindValue { sender_id, key })
+            }
+            8 => {
                 let sender_id = read_id(&mut bytes)?;
                 let key = read_key(&mut bytes)?;
                 if bytes.is_empty() { return Err("truncated value packet".to_string()); }
