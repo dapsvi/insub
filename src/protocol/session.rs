@@ -5,6 +5,7 @@ use crate::crypto::ratchet::DoubleRatchet;
 use crate::crypto::handshake::{Initiator, Responder};
 use crate::protocol::message::Message;
 use crate::protocol::packet::Packet;
+use crate::protocol::payload::{Payload, PayloadTag};
 use sha2::{Sha256, Digest};
 
 pub struct Session {
@@ -147,19 +148,25 @@ impl Session {
             .encrypt(&bytes)
             .map_err(|e| e.to_string())?;
 
-        let mut payload: Vec<u8> = Vec::with_capacity(32 + ciphertext.len());
-        payload.extend_from_slice(&our_dh_pub);
-        payload.extend_from_slice(&ciphertext);
+        let mut data: Vec<u8> = Vec::with_capacity(32 + ciphertext.len());
+        data.extend_from_slice(&our_dh_pub);
+        data.extend_from_slice(&ciphertext);
+
+        let payload = Payload::new(PayloadTag::Message, data);
 
         Ok(Packet::new(1, 0, rand::rng().random(), nonce, payload))
     }
 
     pub fn receive(&mut self, packet: &Packet) -> Result<Message, String> {
-        let their_dh_pub: [u8; 32] = packet.payload[..32]
+        if packet.payload.tag != PayloadTag::Message {
+            return Err(format!("expected Message payload, got {:?}", packet.payload.tag));
+        }
+
+        let their_dh_pub: [u8; 32] = packet.payload.data[..32]
             .try_into()
             .map_err(|_| "packet too short: missing DH public key")?;
 
-        let ciphertext = &packet.payload[32..];
+        let ciphertext = &packet.payload.data[32..];
 
         let plaintext = self.ratchet
             .as_mut()

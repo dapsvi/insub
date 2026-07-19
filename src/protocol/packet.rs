@@ -1,10 +1,10 @@
+use crate::protocol::payload::Payload;
+
 pub enum PacketFlag {
     AckRequired,        // 0x01
     Ack,                // 0x02
     Fragmented,         // 0x04
     LastFragment,       // 0x08
-    Handshake,          // 0x10
-    Relay,              // 0x20
 }
 
 pub fn flag_to_int(flag: PacketFlag) -> u32 {
@@ -13,8 +13,6 @@ pub fn flag_to_int(flag: PacketFlag) -> u32 {
         PacketFlag::Ack             => 0b00000010,
         PacketFlag::Fragmented      => 0b00000100,
         PacketFlag::LastFragment    => 0b00001000,
-        PacketFlag::Handshake       => 0b00010000,
-        PacketFlag::Relay           => 0b00100000,
     };
     int
 }
@@ -50,39 +48,30 @@ pub struct PacketHeader {
 
 pub struct Packet {
     pub header: PacketHeader,
-    pub payload: Vec<u8>,
+    pub payload: Payload,
 }
 
 impl Packet {
-    pub fn new(version: u64, flags: u32, id: u128, nonce: [u8; 12], payload: Vec<u8>) -> Packet {
-        let header = PacketHeader{
+    pub fn new(version: u64, flags: u32, id: u128, nonce: [u8; 12], payload: Payload) -> Packet {
+        let header = PacketHeader {
             version,
             flags: PacketFlags { flags },
             id,
             nonce,
         };
-        
-        Packet{
-            header,
-            payload,
-        }
+        Packet { header, payload }
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        // serialization will store the packet in this order :
-        // 1. version           (64 bits = 8 bytes)
-        // 2. flags             (32 bits = 4 bytes)
-        // 3. id                (128 bits = 16 bytes)
-        // 4. nonce             (12 bytes)
-        // 5. payload           (rest of the vector)
-        let total_length = 8 + 4 + 16 + 12 + self.payload.len();
+        let payload_bytes = self.payload.serialize();
+        let total_length = 8 + 4 + 16 + 12 + payload_bytes.len();
         let mut serialized = Vec::with_capacity(total_length);
 
         serialized.extend_from_slice(&self.header.version.to_be_bytes());
         serialized.extend_from_slice(&self.header.flags.to_int().to_be_bytes());
         serialized.extend_from_slice(&self.header.id.to_be_bytes());
         serialized.extend_from_slice(&self.header.nonce);
-        serialized.extend_from_slice(&self.payload);
+        serialized.extend_from_slice(&payload_bytes);
 
         serialized
     }
@@ -111,7 +100,8 @@ impl Packet {
             .try_into()
             .map_err(|_| "Failed to parse packet nonce")?;
 
-        let payload = serialized;  // rest of the packet
+        let payload = Payload::from_serialized(serialized)
+            .map_err(|_| "Failed to parse payload")?;
 
         Ok(Packet {
             header: PacketHeader {

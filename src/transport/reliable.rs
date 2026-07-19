@@ -5,6 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::protocol::packet::{flag_to_int, Packet, PacketFlag, PacketFlags};
+use crate::protocol::payload::{Payload, PayloadTag};
 
 const MAX_RETRIES: u8 = 5;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -62,7 +63,7 @@ impl ReliableTransport {
                                 ack_flags.to_int(),
                                 packet.header.id,
                                 [0u8; 12],
-                                vec![],
+                                Payload::new(PayloadTag::KeepAlive, vec![]),
                             );
                             let _ = recv_socket.send_to(&ack.serialize(), sender);
                         }

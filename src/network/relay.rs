@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use crate::network::registry::RelayRegistry;
-use crate::protocol::packet::PacketFlag;
+use crate::protocol::payload::{Payload, PayloadTag};
 use crate::transport::udp::UdpTransport;
 
 pub struct RelayFrame {
@@ -60,11 +60,11 @@ impl RelayNode {
                 }
             };
 
-            if !packet.header.flags.contains(PacketFlag::Relay) {
+            if packet.payload.tag != PayloadTag::RelayFrame {
                 continue;
             }
 
-            let frame = match RelayFrame::from_serialized(packet.payload) {
+            let frame = match RelayFrame::from_serialized(packet.payload.data) {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("bad relay frame: {e}");

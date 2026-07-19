@@ -14,22 +14,18 @@ use network::relay::RelayNode;
 use network::registry::{self, RelayEntry, RelayRegistry};
 use network::relay::RelayFrame;
 use protocol::message::Message;
-use protocol::packet::{flag_to_int, Packet, PacketFlag};
+use protocol::packet::Packet;
+use protocol::payload::{Payload, PayloadTag};
 use protocol::session::Session;
 use rand::RngExt;
 use transport::udp::UdpTransport;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-// Wrap an inner Packet inside a RelayFrame inside an outer Packet flagged as Relay
+// Wrap an inner Packet inside a RelayFrame inside a Packet with RelayFrame payload
 fn relay_wrap(dest_id: u128, inner_packet: &Packet) -> Packet {
     let frame = RelayFrame::new(dest_id, inner_packet.serialize());
-    Packet::new(
-        1,
-        flag_to_int(PacketFlag::Relay),
-        rand::rng().random(),
-        [0u8; 12],
-        frame.serialize(),
-    )
+    let payload = Payload::new(PayloadTag::RelayFrame, frame.serialize());
+    Packet::new(1, 0, rand::rng().random(), [0u8; 12], payload)
 }
 
 fn main() {
@@ -73,21 +69,16 @@ fn main() {
         )
         .unwrap();
 
-        // handshake msg1 wrapped in Packet(Handshake) inside Packet(Relay)
+        // handshake msg1 wrapped as Handshake payload inside RelayFrame
         let msg1 = session.initiate_handshake().unwrap();
-        let handshake_pkt = Packet::new(
-            1,
-            flag_to_int(PacketFlag::Handshake),
-            rand::rng().random(),
-            [0u8; 12],
-            msg1,
-        );
+        let handshake_payload = Payload::new(PayloadTag::Handshake, msg1);
+        let handshake_pkt = Packet::new(1, 0, rand::rng().random(), [0u8; 12], handshake_payload);
         udp.send_to(&relay_wrap(bob_id, &handshake_pkt), relay_addr)
             .unwrap();
 
-        // relay forwards the inner Packet(Handshake) — receive it directly
+        // relay forwards the inner Packet — check the Handshake payload
         let (resp_pkt, _) = udp.recv_from().unwrap();
-        session.complete_handshake(&resp_pkt.payload).unwrap();
+        session.complete_handshake(&resp_pkt.payload.data).unwrap();
         println!("[alice] handshake complete");
 
         // message
@@ -108,18 +99,13 @@ fn main() {
         let udp = UdpTransport::bind(bob_addr).unwrap();
         let mut session = Session::new_responder(bob_device.as_bytes()).unwrap();
 
-        // receive handshake — relay forwarded the inner Packet(Handshake)
+        // receive handshake — relay forwarded the inner Packet
         let (msg1_pkt, _) = udp.recv_from().unwrap();
-        session.accept_handshake(&msg1_pkt.payload).unwrap();
+        session.accept_handshake(&msg1_pkt.payload.data).unwrap();
 
         let msg2 = session.reply_handshake().unwrap();
-        let handshake_pkt = Packet::new(
-            1,
-            flag_to_int(PacketFlag::Handshake),
-            rand::rng().random(),
-            [0u8; 12],
-            msg2,
-        );
+        let handshake_payload = Payload::new(PayloadTag::Handshake, msg2);
+        let handshake_pkt = Packet::new(1, 0, rand::rng().random(), [0u8; 12], handshake_payload);
         udp.send_to(&relay_wrap(alice_id, &handshake_pkt), relay_addr)
             .unwrap();
         println!("[bob] handshake complete");
