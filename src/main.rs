@@ -3,6 +3,7 @@ pub mod protocol;
 pub mod identity;
 pub mod transport;
 pub mod network;
+pub mod dht;
 
 use std::net::SocketAddr;
 use std::thread;
