@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
 
+use crate::dht::node::DhtNode;
 use crate::network::registry::RelayRegistry;
-use crate::protocol::payload::{Payload, PayloadTag};
-use crate::transport::udp::UdpTransport;
+use crate::protocol::payload::PayloadTag;
+use crate::transport::reliable::ReliableTransport;
 
 pub struct RelayFrame {
     pub dest_id: u128,
@@ -39,20 +40,29 @@ impl RelayFrame {
 }
 
 pub struct RelayNode {
-    transport: UdpTransport,
+    transport: ReliableTransport,
     registry: RelayRegistry,
+    dht_node: Option<DhtNode>,
 }
 
 impl RelayNode {
     pub fn bind(port: u16, registry: RelayRegistry) -> Result<Self, std::io::Error> {
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let transport = UdpTransport::bind(addr)?;
-        Ok(Self { transport, registry })
+        let transport = ReliableTransport::bind(addr)?;
+        Ok(Self {
+            transport,
+            registry,
+            dht_node: None,
+        })
     }
 
-    pub fn run(&self) -> ! {
+    pub fn enable_dht(&mut self, node_id: crate::dht::node_id::NodeID, addr: SocketAddr) {
+        self.dht_node = Some(DhtNode::new(node_id, addr));
+    }
+
+    pub fn run(&mut self) -> ! {
         loop {
-            let (packet, _sender) = match self.transport.recv_from() {
+            let (packet, sender) = match self.transport.recv() {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("relay recv error: {e}");
@@ -60,21 +70,29 @@ impl RelayNode {
                 }
             };
 
-            if packet.payload.tag != PayloadTag::RelayFrame {
-                continue;
-            }
-
-            let frame = match RelayFrame::from_serialized(packet.payload.data) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("bad relay frame: {e}");
-                    continue;
+            match packet.payload.tag {
+                PayloadTag::RelayFrame => self.handle_relay_frame(&packet),
+                PayloadTag::DhtOperation => {
+                    if let Some(ref mut dht) = self.dht_node {
+                        dht.handle(&packet, sender, &self.transport);
+                    }
                 }
-            };
-
-            if let Some(entry) = self.registry.lookup(frame.dest_id) {
-                let _ = self.transport.send_to_bytes(&frame.payload, entry.address);
+                _ => {}
             }
+        }
+    }
+
+    fn handle_relay_frame(&mut self, packet: &crate::protocol::packet::Packet) {
+        let frame = match RelayFrame::from_serialized(packet.payload.data.clone()) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("bad relay frame: {e}");
+                return;
+            }
+        };
+
+        if let Some(entry) = self.registry.lookup(frame.dest_id) {
+            let _ = self.transport.socket().send_to(&frame.payload, entry.address);
         }
     }
 }

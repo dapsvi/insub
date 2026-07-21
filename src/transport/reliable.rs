@@ -22,7 +22,7 @@ struct Pending {
 pub struct ReliableTransport {
     socket: UdpSocket,
     pending: Arc<Mutex<HashMap<u128, Pending>>>,
-    recv_rx: mpsc::Receiver<Packet>,
+    recv_rx: mpsc::Receiver<(Packet, SocketAddr)>,
 }
 
 impl ReliableTransport {
@@ -93,7 +93,7 @@ impl ReliableTransport {
 
                         seen.insert(packet.header.id, now);
 
-                        if tx.send(packet).is_err() {
+                        if tx.send((packet, sender)).is_err() {
                             break;
                         }
                     }
@@ -154,11 +154,16 @@ impl ReliableTransport {
         Ok(())
     }
 
-    // block until a data Packet arrives
-    pub fn recv(&self) -> Result<Packet, String> {
+    pub fn recv(&self) -> Result<(Packet, SocketAddr), String> {
         self.recv_rx
             .recv()
             .map_err(|_| "recv thread died".to_string())
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<(Packet, SocketAddr), String> {
+        self.recv_rx
+            .recv_timeout(timeout)
+            .map_err(|_| "recv timed out or thread died".to_string())
     }
 
     // expose the underlying socket for unreliable sends (handshake phase)

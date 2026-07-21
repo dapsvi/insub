@@ -65,7 +65,7 @@ fn main() {
     );
 
     // ----- start relay -----
-    let relay_node = RelayNode::bind(8000, registry).unwrap();
+    let mut relay_node = RelayNode::bind(8000, registry).unwrap();
     thread::spawn(move || relay_node.run());
     thread::sleep(Duration::from_millis(100));
 

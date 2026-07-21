@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
+use rand::RngExt;
 
 use crate::dht::protocol::DhtOperation;
+use crate::dht::routing;
 use crate::dht::{node_id::NodeID, routing::RoutingTable};
 use crate::protocol::packet::Packet;
 use crate::protocol::payload::{Payload, PayloadTag};
 use crate::transport::reliable::ReliableTransport;
-use rand::RngExt;
 
 pub struct DhtNode {
     pub id: NodeID,
@@ -17,6 +18,15 @@ pub struct DhtNode {
 }
 
 impl DhtNode {
+    pub fn new(id: NodeID, addr: SocketAddr) -> Self {
+        DhtNode {
+            id,
+            addr,
+            routing: RoutingTable::new(id),
+            store: HashMap::new(),
+        }
+    }
+
     pub fn handle(
         &mut self,
         packet: &Packet,
@@ -39,7 +49,7 @@ impl DhtNode {
             }
             DhtOperation::Pong { .. } => {}
             DhtOperation::FindNode { target_id, .. } => {
-                let nodes = self.routing.closest_nodes(&target_id, 20);
+                let nodes = self.routing.closest_nodes(&target_id, routing::K);
                 let response = DhtOperation::Nodes {
                     sender_id: self.id,
                     nodes,
@@ -70,7 +80,7 @@ impl DhtNode {
                     .get(&key)
                     .filter(|(_, expires)| *expires > now)
                     .map(|(v, _)| v.clone());
-                let closest = self.routing.closest_nodes(&NodeID { id: key }, 20);
+                let closest = self.routing.closest_nodes(&NodeID { id: key }, routing::K);
                 let response = DhtOperation::Value {
                     sender_id: self.id,
                     key,

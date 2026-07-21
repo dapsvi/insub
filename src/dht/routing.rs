@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use crate::dht::node_id::NodeID;
 
-const K: usize = 20;
+pub const K: usize = 20;
 
 pub struct RoutingTable {
     local_id: NodeID,
