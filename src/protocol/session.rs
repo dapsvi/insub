@@ -1,12 +1,13 @@
+use hkdf::Hkdf;
 use rand::RngExt;
+use sha2::{Sha256, Digest};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::crypto::ratchet::DoubleRatchet;
 use crate::crypto::handshake::{Initiator, Responder};
+use crate::crypto::ratchet::DoubleRatchet;
 use crate::protocol::message::Message;
 use crate::protocol::packet::Packet;
 use crate::protocol::payload::{Payload, PayloadTag};
-use sha2::{Sha256, Digest};
 
 pub struct Session {
     initiator: Option<Initiator>,
@@ -14,7 +15,6 @@ pub struct Session {
     ratchet: Option<DoubleRatchet>,
     handshake_hash: Option<[u8; 32]>,
     remote_static: Option<[u8; 32]>,
-    our_device_x25519_priv: Option<[u8; 32]>,
     our_ratchet_dh_priv: Option<[u8; 32]>,
     their_ratchet_dh_pub: Option<[u8; 32]>,
 }
@@ -32,7 +32,6 @@ impl Session {
             ratchet: None,
             handshake_hash: None,
             remote_static: None,
-            our_device_x25519_priv: Some(*our_device_x25519_priv),
             our_ratchet_dh_priv: None,
             their_ratchet_dh_pub: None,
         })
@@ -56,17 +55,18 @@ impl Session {
             .ok_or("Session is not an initiator")?
             .finish(response)?;
 
-        let shared_secret = static_dh(
-            &self.our_device_x25519_priv.unwrap(),
-            &result.remote_static,
-        );
-
         let their_ratchet_pub: [u8; 32] = result.peer_ratchet_pub
             .try_into()
             .map_err(|_| "invalid peer ratchet pubkey length")?;
 
+        let root_key = derive_root_key(
+            &result.handshake_hash,
+            &self.our_ratchet_dh_priv.unwrap(),
+            &their_ratchet_pub,
+        );
+
         self.ratchet = Some(DoubleRatchet::new(
-            shared_secret,
+            root_key,
             self.our_ratchet_dh_priv.unwrap(),
             their_ratchet_pub,
         ));
@@ -84,14 +84,13 @@ impl Session {
         our_device_x25519_priv: &[u8; 32],
     ) -> Result<Self, String> {
         let responder = Responder::new(our_device_x25519_priv)?;
-        
+
         Ok(Session {
             initiator: None,
             responder: Some(responder),
             ratchet: None,
             handshake_hash: None,
             remote_static: None,
-            our_device_x25519_priv: Some(*our_device_x25519_priv),
             our_ratchet_dh_priv: None,
             their_ratchet_dh_pub: None,
         })
@@ -120,13 +119,14 @@ impl Session {
             .ok_or("Session is not a responder")?
             .reply(ratchet_pub.to_vec())?;
 
-        let shared_secret = static_dh(
-            &self.our_device_x25519_priv.unwrap(),
-            &result.remote_static,
+        let root_key = derive_root_key(
+            &result.handshake_hash,
+            &self.our_ratchet_dh_priv.unwrap(),
+            &self.their_ratchet_dh_pub.unwrap(),
         );
 
         self.ratchet = Some(DoubleRatchet::new(
-            shared_secret,
+            root_key,
             self.our_ratchet_dh_priv.unwrap(),
             self.their_ratchet_dh_pub.unwrap(),
         ));
@@ -203,8 +203,14 @@ impl Session {
     }
 }
 
-fn static_dh(our_priv: &[u8; 32], their_pub: &[u8; 32]) -> [u8; 32] {
-    let our_secret = StaticSecret::from(*our_priv);
-    let their_pubkey = PublicKey::from(*their_pub);
-    *our_secret.diffie_hellman(&their_pubkey).as_bytes()
+fn derive_root_key(handshake_hash: &[u8; 32], our_ratchet_priv: &[u8; 32], their_ratchet_pub: &[u8; 32]) -> [u8; 32] {
+    let our_secret = StaticSecret::from(*our_ratchet_priv);
+    let their_pubkey = PublicKey::from(*their_ratchet_pub);
+    let dh_output = *our_secret.diffie_hellman(&their_pubkey).as_bytes();
+
+    let mut root_key = [0u8; 32];
+    Hkdf::<Sha256>::new(Some(handshake_hash), &dh_output)
+        .expand(b"insub-ratchet-root", &mut root_key)
+        .expect("HKDF expand failed");
+    root_key
 }
