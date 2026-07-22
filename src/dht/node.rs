@@ -43,7 +43,7 @@ impl DhtNode {
         match op {
             // server queries: answer first, then add sender to routing
             DhtOperation::Ping { .. } => {
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
                 let pong = DhtOperation::Pong {
                     sender_id: self.id,
                 };
@@ -59,7 +59,7 @@ impl DhtNode {
                     nodes,
                 };
                 self.send(response, sender, transport);
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
             }
             DhtOperation::FindValue { key, .. } => {
                 let now = Instant::now();
@@ -79,10 +79,10 @@ impl DhtNode {
                     closest_nodes: closest,
                 };
                 self.send(response, sender, transport);
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
             }
             DhtOperation::Store { key, value, ttl_seconds, .. } => {
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
                 let expires = Instant::now()
                     .checked_add(std::time::Duration::from_secs(ttl_seconds as u64))
                     .unwrap_or(Instant::now());
@@ -95,19 +95,19 @@ impl DhtNode {
             }
             // response types: add sender to routing
             DhtOperation::Pong { .. } => {
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
             }
             DhtOperation::Nodes { nodes, .. } => {
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
                 for (id, addr) in nodes {
-                    self.routing.add_node(id, addr);
+                    let _ = self.routing.add_node(id, addr);
                 }
             }
             DhtOperation::StoreAck { .. } => {
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
             }
             DhtOperation::Value { closest_nodes, .. } => {
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
                 for (id, addr) in closest_nodes {
                     self.routing.add_node(id, addr);
                 }
@@ -123,7 +123,7 @@ impl DhtNode {
 
         match op {
             DhtOperation::Ping { .. } => {
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
                 let pong = DhtOperation::Pong { sender_id: self.id };
                 Some((pong, sender))
             }
@@ -133,7 +133,7 @@ impl DhtNode {
                     .filter(|(id, _)| *id != sid)
                     .collect();
                 let response = DhtOperation::Nodes { sender_id: self.id, nodes };
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
                 Some((response, sender))
             }
             DhtOperation::FindValue { key, .. } => {
@@ -146,11 +146,11 @@ impl DhtNode {
                     .filter(|(id, _)| *id != sid)
                     .collect();
                 let response = DhtOperation::Value { sender_id: self.id, key, value, closest_nodes: closest };
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
                 Some((response, sender))
             }
             DhtOperation::Store { key, value, ttl_seconds, .. } => {
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
                 let expires = Instant::now()
                     .checked_add(std::time::Duration::from_secs(ttl_seconds as u64))
                     .unwrap_or(Instant::now());
@@ -159,15 +159,15 @@ impl DhtNode {
                 Some((ack, sender))
             }
             // response types: just learn the sender
-            DhtOperation::Pong { .. } => { self.routing.add_node(sid, sender); None }
+            DhtOperation::Pong { .. } => { let _ = self.routing.add_node(sid, sender); None }
             DhtOperation::Nodes { nodes, .. } => {
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
                 for (id, addr) in nodes { self.routing.add_node(id, addr); }
                 None
             }
-            DhtOperation::StoreAck { .. } => { self.routing.add_node(sid, sender); None }
+            DhtOperation::StoreAck { .. } => { let _ = self.routing.add_node(sid, sender); None }
             DhtOperation::Value { closest_nodes, .. } => {
-                self.routing.add_node(sid, sender);
+                let _ = self.routing.add_node(sid, sender);
                 for (id, addr) in closest_nodes { self.routing.add_node(id, addr); }
                 None
             }

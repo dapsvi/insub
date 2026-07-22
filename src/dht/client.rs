@@ -134,13 +134,13 @@ impl DhtClient {
         match op {
             DhtOperation::Nodes { nodes, .. } => {
                 for (id, addr) in nodes {
-                    routing.add_node(id, addr);
+                    let _ = routing.add_node(id, addr);
                     pending.shortlist.push((id, addr));
                 }
             }
             DhtOperation::Value { value, closest_nodes, .. } => {
                 for (id, addr) in closest_nodes {
-                    routing.add_node(id, addr);
+                    let _ = routing.add_node(id, addr);
                     pending.shortlist.push((id, addr));
                 }
                 if value.is_some() {

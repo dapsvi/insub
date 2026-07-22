@@ -130,7 +130,10 @@ impl Runtime {
         while let Some((op, addr)) = next {
             self.send_dht_op(&op, addr);
             let (response, sender) = self.recv_dht(addr)?;
-            self.routing.add_node(response.sender_id(), sender);
+            if let Some((_ping_id, ping_addr)) = self.routing.add_node(response.sender_id(), sender) {
+                let ping = DhtOperation::Ping { sender_id: self.id };
+                self.send_dht_op(&ping, ping_addr);
+            }
 
             let (maybe_next, done) = self.client.handle_response(response, &mut self.routing);
 
@@ -150,7 +153,10 @@ impl Runtime {
         while let Some((op, addr)) = next {
             self.send_dht_op(&op, addr);
             let (response, sender) = self.recv_dht(addr)?;
-            self.routing.add_node(response.sender_id(), sender);
+            if let Some((_ping_id, ping_addr)) = self.routing.add_node(response.sender_id(), sender) {
+                let ping = DhtOperation::Ping { sender_id: self.id };
+                self.send_dht_op(&ping, ping_addr);
+            }
 
             let (maybe_next, done) = self.client.handle_response(response, &mut self.routing);
 
@@ -171,7 +177,10 @@ impl Runtime {
         while let Some((op, addr)) = next {
             self.send_dht_op(&op, addr);
             let (response, sender) = self.recv_dht(addr)?;
-            self.routing.add_node(response.sender_id(), sender);
+            if let Some((_ping_id, ping_addr)) = self.routing.add_node(response.sender_id(), sender) {
+                let ping = DhtOperation::Ping { sender_id: self.id };
+                self.send_dht_op(&ping, ping_addr);
+            }
 
             let (maybe_next, done) = self.client.handle_response(response, &mut self.routing);
 
@@ -233,6 +242,7 @@ impl Runtime {
                 }
             }
         }
+        self.routing.evict_stale();
     }
 
     pub fn serve_forever(&mut self) {

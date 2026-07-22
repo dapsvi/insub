@@ -49,9 +49,11 @@ impl RoutingTable {
             .unwrap_or(255)
     }
 
-    pub fn add_node(&mut self, node: NodeID, addr: SocketAddr) {
+    // returns the oldest active node to ping when the newcomer
+    // lands in candidates because the active bucket is full
+    pub fn add_node(&mut self, node: NodeID, addr: SocketAddr) -> Option<(NodeID, SocketAddr)> {
         if node == self.local_id {
-            return;
+            return None;
         }
 
         let idx = self.bucket(&node);
@@ -62,24 +64,37 @@ impl RoutingTable {
         if let Some(pos) = Bucket::entry_position(&bucket.active, &node) {
             bucket.active.remove(pos);
             bucket.active.push(Entry { id: node, addr, last_seen: now, last_pinged: None });
-            return;
+            return None;
         }
 
         // already in candidates
         if let Some(pos) = Bucket::entry_position(&bucket.candidates, &node) {
             bucket.candidates.remove(pos);
             bucket.candidates.push(Entry { id: node, addr, last_seen: now, last_pinged: None });
-            return;
+            return None;
         }
 
         let entry = Entry { id: node, addr, last_seen: now, last_pinged: None };
 
         if bucket.active.len() < K {
             bucket.active.push(entry);
-        } else if bucket.candidates.len() < K {
-            bucket.candidates.push(entry);
+            return None;
         }
-        // else: both full, silently dropped
+
+        if bucket.candidates.len() < K {
+            bucket.candidates.push(entry);
+            return bucket.active
+                .iter_mut()
+                .filter(|e| e.last_pinged.map_or(true, |t| now.duration_since(t) > PING_COOLDOWN))
+                .min_by_key(|e| e.last_seen)
+                .map(|e| {
+                    e.last_pinged = Some(now);
+                    (e.id, e.addr)
+                });
+        }
+
+        // both full, silently dropped
+        None
     }
 
     pub fn remove_node(&mut self, node: &NodeID) {
@@ -108,26 +123,6 @@ impl RoutingTable {
         }
 
         None
-    }
-
-    // called when we receive a Pong (or any response) from a node
-    pub fn mark_alive(&mut self, node: &NodeID, addr: SocketAddr) {
-        let idx = self.bucket(node);
-        let bucket = &mut self.buckets[idx];
-        let now = Instant::now();
-
-        // update active entry
-        if let Some(pos) = Bucket::entry_position(&bucket.active, node) {
-            bucket.active.remove(pos);
-            bucket.active.push(Entry { id: *node, addr, last_seen: now, last_pinged: None });
-            return;
-        }
-
-        // update candidate entry
-        if let Some(pos) = Bucket::entry_position(&bucket.candidates, node) {
-            bucket.candidates.remove(pos);
-            bucket.candidates.push(Entry { id: *node, addr, last_seen: now, last_pinged: None });
-        }
     }
 
     // move stale active entries (pinged but no pong within STALE_THRESHOLD)
