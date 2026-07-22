@@ -93,7 +93,10 @@ impl DhtClient {
                 let op = DhtOperation::FindNode { sender_id: self.id, target_id: target };
                 Some((op, addr))
             }
-            None => None,
+            None => {
+                self.pending = Some(pending);
+                None
+            }
         }
     }
 
@@ -115,7 +118,10 @@ impl DhtClient {
                 let op = DhtOperation::FindValue { sender_id: self.id, key };
                 Some((op, addr))
             }
-            None => None,
+            None => {
+                self.pending = Some(pending);
+                None
+            }
         }
     }
 
@@ -161,7 +167,10 @@ impl DhtClient {
                 self.pending = Some(pending);
                 (Some((op, addr)), false)
             }
-            None => (None, true),
+            None => {
+                self.pending = Some(pending);
+                (None, true)
+            }
         }
     }
 
