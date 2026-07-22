@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use crate::dht::node_id::NodeID;
 use crate::protocol::wire::take_bytes;
 
-pub const MAX_VALUE_SIZE: usize = 1024;
+pub const MAX_VALUE_SIZE: usize = 1024; // TODO
 
 pub enum DhtOperation {
     Ping { sender_id: NodeID },

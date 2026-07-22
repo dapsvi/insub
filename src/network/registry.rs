@@ -1,8 +1,9 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
-use crate::protocol::wire::take_bytes;
+use crate::{identity::identity::MasterKeyPair, protocol::wire::take_bytes};
 
 pub struct RelayEntry {
     pub id: u128,
@@ -147,6 +148,27 @@ impl RelayRegistry {
 pub struct RelayAnnouncement {
     signature: [u8; 64],
     entry: RelayEntry,
+}
+
+impl RelayAnnouncement {
+    pub fn new(keypair: &MasterKeyPair, entry: RelayEntry) -> Self {
+        let entry_bytes = entry.serialize();
+        let signature = keypair.sign(&entry_bytes).to_bytes();
+        RelayAnnouncement { signature, entry }
+    }
+
+    pub fn verify(&self) -> bool {
+        let signature = Signature::from_bytes(&self.signature);
+        let bytes = self.entry.serialize();
+        let vk = match VerifyingKey::from_bytes(&self.entry.pubkey) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        match vk.verify(&bytes, &signature) {
+            Ok(_) => true,
+            Err(_) => false
+        }
+    }
 }
 
 pub struct PeerId {

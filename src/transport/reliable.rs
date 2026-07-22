@@ -141,7 +141,6 @@ impl ReliableTransport {
             packet.header.version,
             flags,
             packet.header.id,
-            packet.header.nonce,
             packet.payload.clone(),
         );
 
@@ -180,7 +179,6 @@ impl ReliableTransport {
             1,
             ack_flags.to_int(),
             id,
-            [0u8; 12],
             Payload::new(PayloadTag::KeepAlive, payload),
         );
         let _ = self.socket.send_to(&ack.serialize(), dest);

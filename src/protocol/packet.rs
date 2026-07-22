@@ -1,4 +1,5 @@
 use crate::protocol::payload::Payload;
+use crate::protocol::wire::take_bytes;
 
 pub enum PacketFlag {
     AckRequired,        // 0x01
@@ -43,7 +44,6 @@ pub struct PacketHeader {
     pub version: u64,
     pub flags: PacketFlags,
     pub id: u128,
-    pub nonce: [u8; 12],
 }
 
 pub struct Packet {
@@ -52,55 +52,33 @@ pub struct Packet {
 }
 
 impl Packet {
-    pub fn new(version: u64, flags: u32, id: u128, nonce: [u8; 12], payload: Payload) -> Packet {
+    pub fn new(version: u64, flags: u32, id: u128, payload: Payload) -> Packet {
         let header = PacketHeader {
             version,
             flags: PacketFlags { flags },
             id,
-            nonce,
         };
         Packet { header, payload }
     }
 
     pub fn serialize(&self) -> Vec<u8> {
         let payload_bytes = self.payload.serialize();
-        let total_length = 8 + 4 + 16 + 12 + payload_bytes.len();
+        let total_length = 8 + 4 + 16 + payload_bytes.len();
         let mut serialized = Vec::with_capacity(total_length);
 
         serialized.extend_from_slice(&self.header.version.to_be_bytes());
         serialized.extend_from_slice(&self.header.flags.to_int().to_be_bytes());
         serialized.extend_from_slice(&self.header.id.to_be_bytes());
-        serialized.extend_from_slice(&self.header.nonce);
         serialized.extend_from_slice(&payload_bytes);
 
         serialized
     }
 
-    pub fn from_serialized(mut serialized: Vec<u8>) -> Result<Packet, &'static str> {
-        let version_bytes = serialized.drain(0..8)
-            .collect::<Vec<u8>>()
-            .try_into()
-            .map_err(|_| "Failed to parse packet version")?;
-        let version = u64::from_be_bytes(version_bytes);
-
-        let flags_bytes = serialized.drain(0..4)
-            .collect::<Vec<u8>>()
-            .try_into()
-            .map_err(|_| "Failed to parse packet flags")?;
-        let flags = u32::from_be_bytes(flags_bytes);
-
-        let id_bytes = serialized.drain(0..16)
-            .collect::<Vec<u8>>()
-            .try_into()
-            .map_err(|_| "Failed to parse packet ID")?;
-        let id = u128::from_be_bytes(id_bytes);
-
-        let nonce: [u8; 12] = serialized.drain(0..12)
-            .collect::<Vec<u8>>()
-            .try_into()
-            .map_err(|_| "Failed to parse packet nonce")?;
-
-        let payload = Payload::from_serialized(serialized)
+    pub fn from_serialized(mut bytes: Vec<u8>) -> Result<Packet, String> {
+        let version = u64::from_be_bytes(take_bytes::<8>(&mut bytes)?);
+        let flags = u32::from_be_bytes(take_bytes::<4>(&mut bytes)?);
+        let id = u128::from_be_bytes(take_bytes::<16>(&mut bytes)?);
+        let payload = Payload::from_serialized(bytes)
             .map_err(|_| "Failed to parse payload")?;
 
         Ok(Packet {
@@ -108,7 +86,6 @@ impl Packet {
                 version,
                 flags: PacketFlags::from_int(flags),
                 id,
-                nonce,
             },
             payload,
         })

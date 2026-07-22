@@ -136,6 +136,10 @@ impl Session {
         Ok(outgoing_message)
     }
 
+    pub fn is_initiator(&self) -> bool {
+        self.initiator.is_some()
+    }
+
     pub fn is_established(&self) -> bool {
         !self.ratchet.is_none()
     }
@@ -148,13 +152,14 @@ impl Session {
             .encrypt(&bytes)
             .map_err(|e| e.to_string())?;
 
-        let mut data: Vec<u8> = Vec::with_capacity(32 + ciphertext.len());
+        let mut data = Vec::with_capacity(12 + 32 + ciphertext.len());
+        data.extend_from_slice(&nonce);
         data.extend_from_slice(&our_dh_pub);
         data.extend_from_slice(&ciphertext);
 
         let payload = Payload::new(PayloadTag::Message, data);
 
-        Ok(Packet::new(1, 0, rand::rng().random(), nonce, payload))
+        Ok(Packet::new(1, 0, rand::rng().random(), payload))
     }
 
     pub fn receive(&mut self, packet: &Packet) -> Result<Message, String> {
@@ -162,16 +167,22 @@ impl Session {
             return Err(format!("expected Message payload, got {:?}", packet.payload.tag));
         }
 
-        let their_dh_pub: [u8; 32] = packet.payload.data[..32]
-            .try_into()
-            .map_err(|_| "packet too short: missing DH public key")?;
+        if packet.payload.data.len() < 44 {
+            return Err("packet too short".to_string());
+        }
 
-        let ciphertext = &packet.payload.data[32..];
+        let nonce: [u8; 12] = packet.payload.data[..12]
+            .try_into()
+            .map_err(|_| "bad nonce")?;
+        let their_dh_pub: [u8; 32] = packet.payload.data[12..44]
+            .try_into()
+            .map_err(|_| "bad DH public key")?;
+        let ciphertext = &packet.payload.data[44..];
 
         let plaintext = self.ratchet
             .as_mut()
             .ok_or("Session not established")?
-            .decrypt(their_dh_pub, &packet.header.nonce, ciphertext)
+            .decrypt(their_dh_pub, &nonce, ciphertext)
             .map_err(|_| "Couldn't decrypt the message")?;
 
         Message::from_serialized(plaintext)

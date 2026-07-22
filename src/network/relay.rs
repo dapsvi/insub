@@ -1,12 +1,7 @@
 use std::net::SocketAddr;
 
-use crate::dht::node::DhtNode;
 use crate::network::registry::RelayRegistry;
-use ed25519_dalek::SigningKey;
-
-use crate::protocol::packet::PacketFlag;
-use crate::protocol::payload::PayloadTag;
-use crate::transport::reliable::ReliableTransport;
+use crate::protocol::packet::{Packet, PacketFlag};
 
 pub struct RelayFrame {
     pub dest_id: u128,
@@ -42,63 +37,29 @@ impl RelayFrame {
     }
 }
 
-pub struct RelayNode {
-    transport: ReliableTransport,
+pub struct RelayForwarder {
     registry: RelayRegistry,
-    dht_node: Option<DhtNode>,
 }
 
-impl RelayNode {
-    pub fn bind(port: u16, registry: RelayRegistry, signing_key: Option<SigningKey>) -> Result<Self, std::io::Error> {
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let transport = ReliableTransport::bind(addr, signing_key)?;
-        Ok(Self {
-            transport,
-            registry,
-            dht_node: None,
-        })
+impl RelayForwarder {
+    pub fn new(registry: RelayRegistry) -> Self {
+        Self { registry }
     }
 
-    pub fn enable_dht(&mut self, node_id: crate::dht::node_id::NodeID, addr: SocketAddr) {
-        self.dht_node = Some(DhtNode::new(node_id, addr));
+    // parse a RelayFrame, look up the destination, reconstruct the
+    // inner packet. returns None if the frame is malformed or the
+    // destination is unknown. the caller sends the packet through
+    // the normal outbound channel and confirms if AckRequired.
+    pub fn resolve(&self, outer: &Packet) -> Option<(Packet, SocketAddr)> {
+        let frame = RelayFrame::from_serialized(outer.payload.data.clone()).ok()?;
+        let entry = self.registry.lookup(frame.dest_id)?;
+        let inner = Packet::from_serialized(frame.payload).ok()?;
+        Some((inner, entry.address))
     }
 
-    pub fn run(&mut self) -> ! {
-        loop {
-            let (packet, sender) = match self.transport.recv() {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("relay recv error: {e}");
-                    continue;
-                }
-            };
-
-            match packet.payload.tag {
-                PayloadTag::RelayFrame => self.handle_relay_frame(&packet, sender),
-                PayloadTag::DhtOperation => {
-                    if let Some(ref mut dht) = self.dht_node {
-                        dht.handle(&packet, sender, &self.transport);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn handle_relay_frame(&mut self, packet: &crate::protocol::packet::Packet, sender: SocketAddr) {
-        let frame = match RelayFrame::from_serialized(packet.payload.data.clone()) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("bad relay frame: {e}");
-                return;
-            }
-        };
-
-        if let Some(entry) = self.registry.lookup(frame.dest_id) {
-            let result = self.transport.socket().send_to(&frame.payload, entry.address);
-            if result.is_ok() && packet.header.flags.contains(PacketFlag::AckRequired) {
-                self.transport.confirm(packet.header.id, sender);
-            }
-        }
+    // after resolve+send succeeds, the caller confirms the outer
+    // packet if the sender asked for it.
+    pub fn should_confirm(&self, outer: &Packet) -> bool {
+        outer.header.flags.contains(PacketFlag::AckRequired)
     }
 }

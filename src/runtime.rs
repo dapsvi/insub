@@ -1,24 +1,28 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::mpsc::{Receiver, SendError};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+use ed25519_dalek::SigningKey;
+use rand::RngExt;
 
 use crate::dht::client::DhtClient;
 use crate::dht::node::DhtNode;
 use crate::dht::node_id::NodeID;
 use crate::dht::protocol::DhtOperation;
 use crate::dht::routing::RoutingTable;
-use ed25519_dalek::SigningKey;
-
+use crate::network::registry::RelayRegistry;
+use crate::network::relay::RelayForwarder;
+use crate::protocol::message::Message;
 use crate::protocol::payload::{Payload, PayloadTag};
 use crate::protocol::packet::{Packet, PacketFlag};
+use crate::protocol::session::Session;
 use crate::transport::reliable::ReliableTransport;
-use rand::RngExt;
 
 // FIFO queue shared between producer and consumer.
-// rejected items are pushed back to the end so they don't
-// block newer items at the front.
+// rejected items are pushed back to the end so they don't block newer items at the front.
 pub struct PacketPile {
     inner: Arc<Mutex<VecDeque<(Packet, SocketAddr)>>>,
 }
@@ -66,12 +70,17 @@ pub struct Runtime {
     relay_pile: PacketPile,
     handshake_pile: PacketPile,
     message_pile: PacketPile,
+    relay_fwd: Option<RelayForwarder>,
+    session: Option<Session>,
+    device_x25519_priv: [u8; 32],
+    peer_pubkey: Option<[u8; 32]>,
     out_tx: mpsc::Sender<(Packet, SocketAddr)>,
     ack_tx: mpsc::Sender<(u128, SocketAddr)>,
+    msg_tx: Option<mpsc::Sender<Message>>,
 }
 
 impl Runtime {
-    pub fn bind(id: NodeID, addr: SocketAddr, signing_key: Option<SigningKey>) -> Result<Self, String> {
+    pub fn bind(id: NodeID, addr: SocketAddr, signing_key: Option<SigningKey>, device_x25519_priv: [u8; 32]) -> Result<Self, String> {
         let transport = ReliableTransport::bind(addr, signing_key)
             .map_err(|err| format!("Couldn't bind to address : {err}"))?;
 
@@ -89,6 +98,7 @@ impl Runtime {
         let sort_relay = relay_pile.clone();
         let sort_handshake = handshake_pile.clone();
         let sort_message = message_pile.clone();
+        
         thread::spawn(move || loop {
             while let Ok((packet, dest)) = out_rx.try_recv() {
                 let _ = transport.send(&packet, dest);
@@ -121,13 +131,37 @@ impl Runtime {
             relay_pile,
             handshake_pile,
             message_pile,
+            relay_fwd: None,
+            session: None,
+            device_x25519_priv,
+            peer_pubkey: None,
             out_tx,
             ack_tx,
+            msg_tx: None,
         })
     }
 
     pub fn enable_server(&mut self) {
         self.server = Some(DhtNode::new(self.id, self.address));
+    }
+
+    pub fn enable_relay(&mut self, registry: RelayRegistry) {
+        self.relay_fwd = Some(RelayForwarder::new(registry));
+    }
+
+    pub fn enable_session_initiator(&mut self, peer_device_x25519_pub: &[u8; 32]) -> Result<Receiver<Message>,String> {
+        let (msg_tx, msg_rx) = mpsc::channel::<Message>();
+        self.session = Some(Session::new_initiator(&self.device_x25519_priv, peer_device_x25519_pub)?);
+        self.msg_tx = Some(msg_tx);
+        self.peer_pubkey = Some(*peer_device_x25519_pub);
+        Ok(msg_rx)
+    }
+
+    pub fn enable_session_responder(&mut self) -> Result<Receiver<Message>, String> {
+        let (msg_tx, msg_rx) = mpsc::channel::<Message>();
+        self.session = Some(Session::new_responder(&self.device_x25519_priv)?);
+        self.msg_tx = Some(msg_tx);
+        Ok(msg_rx)
     }
 
     // DHT section
@@ -249,9 +283,18 @@ impl Runtime {
             let op = DhtOperation::from_serialized(packet.payload.data)
                 .map_err(|e| format!("bad dht response: {e}"))?;
             if packet.header.flags.contains(PacketFlag::AckRequired) {
-                self.confirm(packet.header.id, sender);
+                let _ = self.confirm(packet.header.id, sender);
             }
             return Ok((op, sender));
+        }
+    }
+
+    pub fn serve_forever(&mut self) {
+        loop {
+            self.tick_server();
+            self.tick_relay();
+            self.tick_handshake();
+            self.tick_message();
         }
     }
 
@@ -260,31 +303,114 @@ impl Runtime {
         if let Some((packet, sender)) = item {
             let is_valid = DhtOperation::from_serialized(packet.payload.data.clone()).is_ok();
             if let Some(ref mut srv) = self.server {
-                if let Some((response, dest)) = srv.process(&packet, sender) {
+                if let Some((response, dest)) = srv.process(&packet, sender, &mut self.routing) {
                     self.send_dht_op(&response, dest);
                 }
             }
             if is_valid && packet.header.flags.contains(PacketFlag::AckRequired) {
-                self.confirm(packet.header.id, sender);
+                let _ = self.confirm(packet.header.id, sender);
             }
         }
         self.routing.evict_stale();
     }
 
-    pub fn serve_forever(&mut self) {
-        loop {
-            self.tick_server();
+    fn tick_relay(&mut self) {
+        let fwd = match self.relay_fwd.as_ref() {
+            Some(f) => f,
+            None => return,
+        };
+        let item = self.relay_pile.pop_timeout(Duration::from_millis(100));
+        if let Some((packet, sender)) = item {
+            if let Some((inner, dest)) = fwd.resolve(&packet) {
+                let _ = self.out_tx.send((inner, dest));
+                if fwd.should_confirm(&packet) {
+                    let _ = self.confirm(packet.header.id, sender);
+                }
+            }
         }
     }
 
     fn send_dht_op(&self, op: &DhtOperation, dest: SocketAddr) {
         let payload = Payload::new(PayloadTag::DhtOperation, op.serialize());
-        let pkt = Packet::new(1, 0, rand::rng().random(), [0u8; 12], payload);
+        let pkt = Packet::new(1, 0, rand::rng().random(), payload);
         let _ = self.out_tx.send((pkt, dest));
     }
 
-    fn confirm(&self, id: u128, dest: SocketAddr) {
-        let _ = self.ack_tx.send((id, dest));
+    fn confirm(&self, id: u128, dest: SocketAddr) -> Result<(), SendError<(u128, SocketAddr)>> {
+        self.ack_tx.send((id, dest))
+    }
+
+    fn tick_handshake(&mut self) {
+        let session = match self.session.as_mut() {
+            Some(s) if !s.is_established() => s,
+            _ => return,            // no session or already done
+        };
+
+        let (packet, sender) = match self.handshake_pile.pop_timeout(Duration::from_millis(100)) {
+            Some(item) => item,
+            None => return,
+        };
+
+        if session.is_initiator() {
+            // we already called initiate_handshake, this packet is the response
+            let _ = session.complete_handshake(&packet.payload.data);
+        } else{
+            // we're the responder: accept the hello, send our reply
+            if session.accept_handshake(&packet.payload.data).is_ok() {
+                if let Ok(reply) = session.reply_handshake() {
+                    let payload = Payload::new(PayloadTag::Handshake, reply);
+                    let pkt = Packet::new(1, 0, rand::rng().random(), payload);
+                    let _ = self.out_tx.send((pkt, sender));
+                }
+            }
+        }
+
+        if packet.header.flags.contains(PacketFlag::AckRequired) {
+            let _ = self.confirm(packet.header.id, sender);
+        }
+    }
+
+    pub fn initiate_handshake(&mut self, dest: SocketAddr) -> Result<(), String> {
+        let bytes = self.session.as_mut()
+            .unwrap()
+            .initiate_handshake()?;
+
+        let payload = Payload::new(PayloadTag::Handshake, bytes);
+        let pkt = Packet::new(1, 0, rand::rng().random(), payload);
+        let _ = self.out_tx.send((pkt, dest));
+
+        Ok(())
+    }
+
+    fn tick_message(&mut self) {
+        if self.session.is_none() {
+            return
+        }
+        if !self.session.as_ref().unwrap().is_established() {
+            return
+        }
+
+        let (packet, sender) = match self.message_pile.pop_timeout(Duration::from_millis(100)) {
+            Some(item) => item,
+            None => return,
+        };
+        let msg = match self.session.as_mut().unwrap().receive(&packet) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let _ = self.msg_tx.as_ref().unwrap().send(msg);
+
+        if packet.header.flags.contains(PacketFlag::AckRequired) {
+            let _ = self.confirm(packet.header.id, sender);
+        }
+    }
+
+    pub fn send_message(&mut self, msg: Message, dest: SocketAddr) {
+        let pkt = match self.session.as_mut().unwrap().send(&msg) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let _ = self.out_tx.send((pkt, dest));
     }
 }
 

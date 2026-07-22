@@ -15,7 +15,6 @@ use ed25519_dalek::SigningKey;
 use dht::node_id::NodeID;
 use identity::identity::MasterKeyPair;
 use identity::keychain::Keychain;
-use network::relay::RelayNode;
 use network::registry::{self, RelayEntry, RelayRegistry};
 use network::relay::RelayFrame;
 use protocol::message::Message;
@@ -30,7 +29,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 fn relay_wrap(dest_id: u128, inner_packet: &Packet) -> Packet {
     let frame = RelayFrame::new(dest_id, inner_packet.serialize());
     let payload = Payload::new(PayloadTag::RelayFrame, frame.serialize());
-    Packet::new(1, 0, rand::rng().random(), [0u8; 12], payload)
+    Packet::new(1, 0, rand::rng().random(), payload)
 }
 
 fn main() {
@@ -73,14 +72,14 @@ fn main() {
     }
 
     // start relay 0 as the seed
-    let mut relay0 = Runtime::bind(relay_ids[0], relay_addrs[0], relay_keys.remove(0)).unwrap();
+    let mut relay0 = Runtime::bind(relay_ids[0], relay_addrs[0], relay_keys.remove(0), [0u8; 32]).unwrap();
     relay0.enable_server();
     let _r0 = thread::spawn(move || { relay0.serve_forever(); });
     thread::sleep(Duration::from_millis(100));
 
     // relays 1..N join the network
     for i in 1..NUM_RELAYS {
-        let mut r = Runtime::bind(relay_ids[i], relay_addrs[i], relay_keys.remove(0)).unwrap();
+        let mut r = Runtime::bind(relay_ids[i], relay_addrs[i], relay_keys.remove(0), [0u8; 32]).unwrap();
         r.enable_server();
         r.join(&[relay_addrs[0]]).unwrap();
         println!("[relay-{i}] joined via relay-0");
@@ -93,7 +92,7 @@ fn main() {
     let leaf_addr: SocketAddr = "127.0.0.1:9100".parse().unwrap();
     let leaf_id = NodeID::from_pubkey(&alice_master.public_key.to_bytes());
     let leaf_sk = Some(SigningKey::from_bytes(&alice_master.to_bytes()));
-    let mut leaf = Runtime::bind(leaf_id, leaf_addr, leaf_sk).unwrap();
+    let mut leaf = Runtime::bind(leaf_id, leaf_addr, leaf_sk, [0u8; 32]).unwrap();
     leaf.join(&[relay_addrs[0]]).unwrap();
     println!("[leaf] joined network");
 
@@ -122,8 +121,10 @@ fn main() {
         RelayEntry::new(bob_id, bob_master.public_key.to_bytes(), bob_addr).unwrap(),
     );
 
-    let mut relay_node = RelayNode::bind(8070, registry, None).unwrap();
-    let _relay = thread::spawn(move || relay_node.run());
+    let msg_relay_id = NodeID { id: [0u8; 32] };
+    let mut msg_relay = Runtime::bind(msg_relay_id, relay_addr, None, [0u8; 32]).unwrap();
+    msg_relay.enable_relay(registry);
+    let _relay = thread::spawn(move || msg_relay.serve_forever());
     thread::sleep(Duration::from_millis(100));
 
     let alice_thread = thread::spawn(move || {
@@ -135,7 +136,7 @@ fn main() {
 
         let msg1 = session.initiate_handshake().unwrap();
         let hp = Payload::new(PayloadTag::Handshake, msg1);
-        let hpkt = Packet::new(1, 0, rand::rng().random(), [0u8; 12], hp);
+        let hpkt = Packet::new(1, 0, rand::rng().random(), hp);
         udp.send_to(&relay_wrap(bob_id, &hpkt), relay_addr).unwrap();
 
         let (resp, _) = udp.recv_from().unwrap();
@@ -163,7 +164,7 @@ fn main() {
 
         let msg2 = session.reply_handshake().unwrap();
         let hp = Payload::new(PayloadTag::Handshake, msg2);
-        let hpkt = Packet::new(1, 0, rand::rng().random(), [0u8; 12], hp);
+        let hpkt = Packet::new(1, 0, rand::rng().random(), hp);
         udp.send_to(&relay_wrap(alice_id, &hpkt), relay_addr).unwrap();
         println!("[bob] handshake complete");
 
