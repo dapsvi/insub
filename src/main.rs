@@ -56,7 +56,7 @@ fn main() {
 
     let alice_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let bob_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-    let relay_addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+    let relay_addr: SocketAddr = "127.0.0.1:8070".parse().unwrap();
 
     // ----- DHT: multi-relay network -----
     println!("--- DHT multi-relay network ---");
