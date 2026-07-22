@@ -199,6 +199,10 @@ impl Runtime {
         let target = NodeID { id: key };
         let closest = self.lookup_node(target)?;
 
+        if closest.is_empty() {
+            return Err("store failed: no nodes known to store to".to_string());
+        }
+
         for (_, addr) in &closest {
             let op = DhtOperation::Store {
                 sender_id: self.id,
@@ -216,9 +220,16 @@ impl Runtime {
     // expected address. server queries and wrong-sender packets go back
     // onto the pile for later dispatch by run().
     fn recv_dht(&self, expected: SocketAddr) -> Result<(DhtOperation, SocketAddr), String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+
         loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("dht recv timed out".to_string());
+            }
+
             let (packet, sender) = self.dht_pile
-                .pop_timeout(Duration::from_secs(5))
+                .pop_timeout(remaining)
                 .ok_or("dht recv timed out")?;
 
             // wrong sender, or it's a packet the client shouldn't consume
