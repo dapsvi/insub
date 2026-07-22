@@ -11,8 +11,7 @@ pub fn encrypt_with_password(plaintext: &[u8], password: &[u8]) -> Result<Vec<u8
     OsRng.fill_bytes(&mut salt);
 
     // derive a 32-byte key from the password using Argon2id
-    let mut key = [0u8; 32];
-    derive_key(password, &salt).map_err(|e| format!("argon2id key derivation failed: {e}"))?;
+    let key = derive_key(password, &salt).map_err(|e| format!("argon2id key derivation failed: {e}"))?;
 
     // encrypt with ChaCha20-Poly1305
     let (ciphertext, nonce) = cipher::encrypt(plaintext, &key)?;
@@ -43,8 +42,7 @@ pub fn decrypt_with_password(encrypted: &[u8], password: &[u8]) -> Result<Vec<u8
     let ciphertext = &encrypted[44..];
 
     // re-derive the same key from password + salt
-    let mut key = [0u8; 32];
-    derive_key(password, salt).map_err(|e| format!("argon2id key derivation failed: {e}"))?;
+    let key = derive_key(password, salt).map_err(|e| format!("argon2id key derivation failed: {e}"))?;
 
     // decrypt
     let plaintext = cipher::decrypt(ciphertext, nonce, &key)?;
