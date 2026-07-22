@@ -2,6 +2,9 @@ use std::net::SocketAddr;
 
 use crate::dht::node::DhtNode;
 use crate::network::registry::RelayRegistry;
+use ed25519_dalek::SigningKey;
+
+use crate::protocol::packet::PacketFlag;
 use crate::protocol::payload::PayloadTag;
 use crate::transport::reliable::ReliableTransport;
 
@@ -46,9 +49,9 @@ pub struct RelayNode {
 }
 
 impl RelayNode {
-    pub fn bind(port: u16, registry: RelayRegistry) -> Result<Self, std::io::Error> {
+    pub fn bind(port: u16, registry: RelayRegistry, signing_key: Option<SigningKey>) -> Result<Self, std::io::Error> {
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let transport = ReliableTransport::bind(addr)?;
+        let transport = ReliableTransport::bind(addr, signing_key)?;
         Ok(Self {
             transport,
             registry,
@@ -71,7 +74,7 @@ impl RelayNode {
             };
 
             match packet.payload.tag {
-                PayloadTag::RelayFrame => self.handle_relay_frame(&packet),
+                PayloadTag::RelayFrame => self.handle_relay_frame(&packet, sender),
                 PayloadTag::DhtOperation => {
                     if let Some(ref mut dht) = self.dht_node {
                         dht.handle(&packet, sender, &self.transport);
@@ -82,7 +85,7 @@ impl RelayNode {
         }
     }
 
-    fn handle_relay_frame(&mut self, packet: &crate::protocol::packet::Packet) {
+    fn handle_relay_frame(&mut self, packet: &crate::protocol::packet::Packet, sender: SocketAddr) {
         let frame = match RelayFrame::from_serialized(packet.payload.data.clone()) {
             Ok(f) => f,
             Err(e) => {
@@ -92,7 +95,10 @@ impl RelayNode {
         };
 
         if let Some(entry) = self.registry.lookup(frame.dest_id) {
-            let _ = self.transport.socket().send_to(&frame.payload, entry.address);
+            let result = self.transport.socket().send_to(&frame.payload, entry.address);
+            if result.is_ok() && packet.header.flags.contains(PacketFlag::AckRequired) {
+                self.transport.confirm(packet.header.id, sender);
+            }
         }
     }
 }

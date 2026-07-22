@@ -9,8 +9,10 @@ use crate::dht::node::DhtNode;
 use crate::dht::node_id::NodeID;
 use crate::dht::protocol::DhtOperation;
 use crate::dht::routing::RoutingTable;
+use ed25519_dalek::SigningKey;
+
 use crate::protocol::payload::{Payload, PayloadTag};
-use crate::protocol::packet::Packet;
+use crate::protocol::packet::{Packet, PacketFlag};
 use crate::transport::reliable::ReliableTransport;
 use rand::RngExt;
 
@@ -65,11 +67,12 @@ pub struct Runtime {
     handshake_pile: PacketPile,
     message_pile: PacketPile,
     out_tx: mpsc::Sender<(Packet, SocketAddr)>,
+    ack_tx: mpsc::Sender<(u128, SocketAddr)>,
 }
 
 impl Runtime {
-    pub fn bind(id: NodeID, addr: SocketAddr) -> Result<Self, String> {
-        let transport = ReliableTransport::bind(addr)
+    pub fn bind(id: NodeID, addr: SocketAddr, signing_key: Option<SigningKey>) -> Result<Self, String> {
+        let transport = ReliableTransport::bind(addr, signing_key)
             .map_err(|err| format!("Couldn't bind to address : {err}"))?;
 
         let dht_pile = PacketPile::new();
@@ -77,9 +80,10 @@ impl Runtime {
         let handshake_pile = PacketPile::new();
         let message_pile = PacketPile::new();
         let (out_tx, out_rx) = mpsc::channel::<(Packet, SocketAddr)>();
+        let (ack_tx, ack_rx) = mpsc::channel::<(u128, SocketAddr)>();
 
         // sorting thread: reads from transport, dispatches to piles.
-        // also handles outbound sends through out_rx so the Runtime
+        // also handles outbound sends and acks so the Runtime
         // never touches the transport directly.
         let sort_dht = dht_pile.clone();
         let sort_relay = relay_pile.clone();
@@ -88,6 +92,9 @@ impl Runtime {
         thread::spawn(move || loop {
             while let Ok((packet, dest)) = out_rx.try_recv() {
                 let _ = transport.send(&packet, dest);
+            }
+            while let Ok((id, dest)) = ack_rx.try_recv() {
+                transport.confirm(id, dest);
             }
 
             match transport.recv_timeout(Duration::from_millis(500)) {
@@ -115,6 +122,7 @@ impl Runtime {
             handshake_pile,
             message_pile,
             out_tx,
+            ack_tx,
         })
     }
 
@@ -240,6 +248,9 @@ impl Runtime {
 
             let op = DhtOperation::from_serialized(packet.payload.data)
                 .map_err(|e| format!("bad dht response: {e}"))?;
+            if packet.header.flags.contains(PacketFlag::AckRequired) {
+                self.confirm(packet.header.id, sender);
+            }
             return Ok((op, sender));
         }
     }
@@ -247,10 +258,14 @@ impl Runtime {
     pub fn tick_server(&mut self) {
         let item = self.dht_pile.pop_timeout(Duration::from_millis(100));
         if let Some((packet, sender)) = item {
+            let is_valid = DhtOperation::from_serialized(packet.payload.data.clone()).is_ok();
             if let Some(ref mut srv) = self.server {
                 if let Some((response, dest)) = srv.process(&packet, sender) {
                     self.send_dht_op(&response, dest);
                 }
+            }
+            if is_valid && packet.header.flags.contains(PacketFlag::AckRequired) {
+                self.confirm(packet.header.id, sender);
             }
         }
         self.routing.evict_stale();
@@ -266,6 +281,10 @@ impl Runtime {
         let payload = Payload::new(PayloadTag::DhtOperation, op.serialize());
         let pkt = Packet::new(1, 0, rand::rng().random(), [0u8; 12], payload);
         let _ = self.out_tx.send((pkt, dest));
+    }
+
+    fn confirm(&self, id: u128, dest: SocketAddr) {
+        let _ = self.ack_tx.send((id, dest));
     }
 }
 

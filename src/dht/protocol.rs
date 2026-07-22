@@ -1,6 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use crate::dht::node_id::NodeID;
+use crate::protocol::wire::take_bytes;
 
 pub const MAX_VALUE_SIZE: usize = 1024;
 
@@ -42,30 +43,25 @@ impl DhtOperation {
         }
     }
 
-    fn read_address(mut bytes: Vec<u8>) -> Result<(SocketAddr, Vec<u8>), String> {
+    fn read_address(bytes: &mut Vec<u8>) -> Result<SocketAddr, String> {
         if bytes.is_empty() {
             return Err("truncated address".to_string());
         }
         let addr_type = bytes.remove(0);
         match addr_type {
             4 => {
-                if bytes.len() < 6 {
-                    return Err("truncated IPv4 address".to_string());
-                }
-                let ip = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
-                let port = u16::from_be_bytes([bytes[4], bytes[5]]);
-                bytes.drain(..6);
-                Ok((SocketAddr::V4(SocketAddrV4::new(ip, port)), bytes))
+                let addr_bytes = take_bytes::<6>(bytes)?;
+                let ip = Ipv4Addr::new(addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3]);
+                let port = u16::from_be_bytes([addr_bytes[4], addr_bytes[5]]);
+                Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
             }
             6 => {
-                if bytes.len() < 18 {
-                    return Err("truncated IPv6 address".to_string());
-                }
-                let ip_bytes: [u8; 16] = bytes[..16].try_into().unwrap();
+                let addr_bytes = take_bytes::<18>(bytes)?;
+                let mut ip_bytes = [0u8; 16];
+                ip_bytes.copy_from_slice(&addr_bytes[..16]);
                 let ip = Ipv6Addr::from(ip_bytes);
-                let port = u16::from_be_bytes([bytes[16], bytes[17]]);
-                bytes.drain(..18);
-                Ok((SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)), bytes))
+                let port = u16::from_be_bytes([addr_bytes[16], addr_bytes[17]]);
+                Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)))
             }
             _ => Err(format!("unknown address type: {addr_type}")),
         }
@@ -93,12 +89,9 @@ impl DhtOperation {
         let count = u16::from_be_bytes([bytes.remove(0), bytes.remove(0)]) as usize;
         let mut nodes = Vec::with_capacity(count);
         for _ in 0..count {
-            if bytes.len() < 32 { return Err("truncated node id".to_string()); }
-            let id_bytes: [u8; 32] = bytes.drain(..32).collect::<Vec<u8>>().try_into().unwrap();
+            let id_bytes = take_bytes::<32>(bytes)?;
             let node_id = NodeID { id: id_bytes };
-            let tail = std::mem::take(bytes);
-            let (addr, rest) = Self::read_address(tail)?;
-            *bytes = rest;
+            let addr = Self::read_address(bytes)?;
             nodes.push((node_id, addr));
         }
         Ok(nodes)
@@ -170,15 +163,11 @@ impl DhtOperation {
         let tag = bytes.remove(0);
 
         fn read_id(bytes: &mut Vec<u8>) -> Result<NodeID, String> {
-            if bytes.len() < 32 { return Err("truncated node id".to_string()); }
-            let id: [u8; 32] = bytes.drain(..32).collect::<Vec<u8>>().try_into().unwrap();
-            Ok(NodeID { id })
+            Ok(NodeID { id: take_bytes(bytes)? })
         }
 
         fn read_key(bytes: &mut Vec<u8>) -> Result<[u8; 32], String> {
-            if bytes.len() < 32 { return Err("truncated key".to_string()); }
-            let k: [u8; 32] = bytes.drain(..32).collect::<Vec<u8>>().try_into().unwrap();
-            Ok(k)
+            take_bytes(bytes)
         }
 
         match tag {
@@ -197,8 +186,7 @@ impl DhtOperation {
             5 => {
                 let sender_id = read_id(&mut bytes)?;
                 let key = read_key(&mut bytes)?;
-                if bytes.len() < 6 { return Err("truncated store payload".to_string()); }
-                let ttl_bytes: [u8; 4] = bytes.drain(..4).collect::<Vec<u8>>().try_into().unwrap();
+                let ttl_bytes = take_bytes::<4>(&mut bytes)?;
                 let ttl_seconds = u32::from_be_bytes(ttl_bytes);
                 let value_len = u16::from_be_bytes([bytes.remove(0), bytes.remove(0)]) as usize;
                 if bytes.len() < value_len { return Err("truncated value".to_string()); }

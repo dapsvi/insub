@@ -11,6 +11,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
 use dht::node_id::NodeID;
 use identity::identity::MasterKeyPair;
 use identity::keychain::Keychain;
@@ -63,21 +64,23 @@ fn main() {
     const NUM_RELAYS: usize = 3;
     let mut relay_ids = Vec::new();
     let mut relay_addrs = Vec::new();
+    let mut relay_keys = Vec::new();
     for i in 0..NUM_RELAYS {
         let (m, _) = MasterKeyPair::new();
         relay_ids.push(NodeID::from_pubkey(&m.public_key.to_bytes()));
         relay_addrs.push(format!("127.0.0.1:{}", 8000 + i).parse::<SocketAddr>().unwrap());
+        relay_keys.push(Some(SigningKey::from_bytes(&m.to_bytes())));
     }
 
     // start relay 0 as the seed
-    let mut relay0 = Runtime::bind(relay_ids[0], relay_addrs[0]).unwrap();
+    let mut relay0 = Runtime::bind(relay_ids[0], relay_addrs[0], relay_keys.remove(0)).unwrap();
     relay0.enable_server();
     let _r0 = thread::spawn(move || { relay0.serve_forever(); });
     thread::sleep(Duration::from_millis(100));
 
     // relays 1..N join the network
     for i in 1..NUM_RELAYS {
-        let mut r = Runtime::bind(relay_ids[i], relay_addrs[i]).unwrap();
+        let mut r = Runtime::bind(relay_ids[i], relay_addrs[i], relay_keys.remove(0)).unwrap();
         r.enable_server();
         r.join(&[relay_addrs[0]]).unwrap();
         println!("[relay-{i}] joined via relay-0");
@@ -89,7 +92,8 @@ fn main() {
     // leaf: join via relay 0, store and find
     let leaf_addr: SocketAddr = "127.0.0.1:9100".parse().unwrap();
     let leaf_id = NodeID::from_pubkey(&alice_master.public_key.to_bytes());
-    let mut leaf = Runtime::bind(leaf_id, leaf_addr).unwrap();
+    let leaf_sk = Some(SigningKey::from_bytes(&alice_master.to_bytes()));
+    let mut leaf = Runtime::bind(leaf_id, leaf_addr, leaf_sk).unwrap();
     leaf.join(&[relay_addrs[0]]).unwrap();
     println!("[leaf] joined network");
 
@@ -118,7 +122,7 @@ fn main() {
         RelayEntry::new(bob_id, bob_master.public_key.to_bytes(), bob_addr).unwrap(),
     );
 
-    let mut relay_node = RelayNode::bind(8070, registry).unwrap();
+    let mut relay_node = RelayNode::bind(8070, registry, None).unwrap();
     let _relay = thread::spawn(move || relay_node.run());
     thread::sleep(Duration::from_millis(100));
 

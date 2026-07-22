@@ -6,7 +6,7 @@ use rand::RngExt;
 use crate::dht::protocol::DhtOperation;
 use crate::dht::routing;
 use crate::dht::{node_id::NodeID, routing::RoutingTable};
-use crate::protocol::packet::Packet;
+use crate::protocol::packet::{Packet, PacketFlag};
 use crate::protocol::payload::{Payload, PayloadTag};
 use crate::transport::reliable::ReliableTransport;
 
@@ -112,6 +112,9 @@ impl DhtNode {
                     self.routing.add_node(id, addr);
                 }
             }
+        }
+        if packet.header.flags.contains(PacketFlag::AckRequired) {
+            transport.confirm(packet.header.id, sender);
         }
     }
 

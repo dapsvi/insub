@@ -2,6 +2,8 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use sha2::{Digest, Sha256};
 
+use crate::protocol::wire::take_bytes;
+
 pub struct RelayEntry {
     pub id: u128,
     pub pubkey: [u8; 32],
@@ -53,50 +55,30 @@ impl RelayEntry {
         bytes
     }
 
-    pub fn from_serialized(bytes: Vec<u8>) -> Result<Self, String> {
-        let id_bytes = bytes[..16].try_into().unwrap();
+    pub fn from_serialized(mut bytes: Vec<u8>) -> Result<Self, String> {
+        let id_bytes = take_bytes::<16>(&mut bytes)?;
         let id = u128::from_be_bytes(id_bytes);
 
-        let pubkey: [u8; 32] = bytes[16..48].try_into().unwrap();
+        let pubkey = take_bytes::<32>(&mut bytes)?;
 
-        let address_marker = bytes[48];
-        let address_bytes = bytes[49..].to_vec();
+        if bytes.is_empty() {
+            return Err("truncated relay entry: missing address marker".to_string());
+        }
+        let address_marker = bytes.remove(0);
+
         let address = match address_marker {
             4 => {
-                // IPv4 expects exactly 6 bytes: 4 for IP + 2 for port
-                if address_bytes.len() != 6 {
-                    return Err("Invalid IPv4 address length".to_string());
-                }
-
-                // Extract the 4 IP bytes
-                let ip = Ipv4Addr::new(
-                    address_bytes[0], 
-                    address_bytes[1], 
-                    address_bytes[2], 
-                    address_bytes[3]
-                );
-
-                // Extract the 2 port bytes (big-endian)
-                let port = u16::from_be_bytes([address_bytes[4], address_bytes[5]]);
-
+                let addr_bytes = take_bytes::<6>(&mut bytes)?;
+                let ip = Ipv4Addr::new(addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3]);
+                let port = u16::from_be_bytes([addr_bytes[4], addr_bytes[5]]);
                 SocketAddr::V4(SocketAddrV4::new(ip, port))
             },
             6 => {
-                // IPv6 expects exactly 18 bytes: 16 for IP + 2 for port
-                if address_bytes.len() != 18 {
-                    return Err("Invalid IPv6 address length".to_string());
-                }
-                
-                // Extract the 16 IP bytes
-                let ip_bytes: [u8; 16] = address_bytes[..16].try_into()
-                    .map_err(|_| "Failed to parse IPv6 IP bytes".to_string())?;
-                    
+                let addr_bytes = take_bytes::<18>(&mut bytes)?;
+                let mut ip_bytes = [0u8; 16];
+                ip_bytes.copy_from_slice(&addr_bytes[..16]);
                 let ip = Ipv6Addr::from(ip_bytes);
-                
-                // Extract the 2 port bytes
-                let port = u16::from_be_bytes([address_bytes[16], address_bytes[17]]);
-                
-                // Note: SocketAddrV6::new also requires flowinfo and scope_id, which we set to 0 as they weren't serialized.
+                let port = u16::from_be_bytes([addr_bytes[16], addr_bytes[17]]);
                 SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0))
             },
             _ => {
@@ -139,17 +121,13 @@ impl RelayRegistry {
     }
 
     pub fn from_serialized(mut bytes: Vec<u8>) -> Result<Self, String> {
-        if bytes.len() < 4 {
-            return Err("registry too short".to_string());
-        }
-        let count = u32::from_be_bytes(bytes.drain(..4).collect::<Vec<u8>>().try_into().unwrap()) as usize;
+        let count_bytes = take_bytes::<4>(&mut bytes)?;
+        let count = u32::from_be_bytes(count_bytes) as usize;
 
         let mut registry = Vec::with_capacity(count);
         for _ in 0..count {
-            if bytes.len() < 4 {
-                return Err("truncated entry length prefix".to_string());
-            }
-            let entry_len = u32::from_be_bytes(bytes.drain(..4).collect::<Vec<u8>>().try_into().unwrap()) as usize;
+            let entry_len_bytes = take_bytes::<4>(&mut bytes)?;
+            let entry_len = u32::from_be_bytes(entry_len_bytes) as usize;
             if bytes.len() < entry_len {
                 return Err("truncated entry bytes".to_string());
             }
