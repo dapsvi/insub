@@ -15,6 +15,8 @@ use crate::dht::protocol::DhtOperation;
 use crate::dht::routing::RoutingTable;
 use crate::network::registry::RelayRegistry;
 use crate::network::relay::RelayForwarder;
+use crate::identity::certificates::DeviceCertificate;
+use crate::identity::identity::UserID;
 use crate::protocol::message::Message;
 use crate::protocol::payload::{Payload, PayloadTag};
 use crate::protocol::packet::{Packet, PacketFlag};
@@ -149,17 +151,33 @@ impl Runtime {
         self.relay_fwd = Some(RelayForwarder::new(registry));
     }
 
-    pub fn enable_session_initiator(&mut self, peer_device_x25519_pub: &[u8; 32]) -> Result<Receiver<Message>,String> {
+    pub fn enable_session_initiator(
+        &mut self,
+        peer_device_x25519_pub: &[u8; 32],
+        device_cert: DeviceCertificate,
+        peer_user_id: UserID,
+    ) -> Result<Receiver<Message>, String> {
         let (msg_tx, msg_rx) = mpsc::channel::<Message>();
-        self.session = Some(Session::new_initiator(&self.device_x25519_priv, peer_device_x25519_pub)?);
+        self.session = Some(Session::new_initiator(
+            &self.device_x25519_priv,
+            peer_device_x25519_pub,
+            device_cert,
+            peer_user_id,
+        )?);
         self.msg_tx = Some(msg_tx);
         self.peer_pubkey = Some(*peer_device_x25519_pub);
         Ok(msg_rx)
     }
 
-    pub fn enable_session_responder(&mut self) -> Result<Receiver<Message>, String> {
+    pub fn enable_session_responder(
+        &mut self,
+        device_cert: DeviceCertificate,
+    ) -> Result<Receiver<Message>, String> {
         let (msg_tx, msg_rx) = mpsc::channel::<Message>();
-        self.session = Some(Session::new_responder(&self.device_x25519_priv)?);
+        self.session = Some(Session::new_responder(
+            &self.device_x25519_priv,
+            device_cert,
+        )?);
         self.msg_tx = Some(msg_tx);
         Ok(msg_rx)
     }
@@ -332,7 +350,7 @@ impl Runtime {
 
     fn send_dht_op(&self, op: &DhtOperation, dest: SocketAddr) {
         let payload = Payload::new(PayloadTag::DhtOperation, op.serialize());
-        let pkt = Packet::new(1, 0, rand::rng().random(), payload);
+        let pkt = Packet::new(0, rand::rng().random(), payload);
         let _ = self.out_tx.send((pkt, dest));
     }
 
@@ -359,7 +377,7 @@ impl Runtime {
             if session.accept_handshake(&packet.payload.data).is_ok() {
                 if let Ok(reply) = session.reply_handshake() {
                     let payload = Payload::new(PayloadTag::Handshake, reply);
-                    let pkt = Packet::new(1, 0, rand::rng().random(), payload);
+                    let pkt = Packet::new(0, rand::rng().random(), payload);
                     let _ = self.out_tx.send((pkt, sender));
                 }
             }
@@ -376,7 +394,7 @@ impl Runtime {
             .initiate_handshake()?;
 
         let payload = Payload::new(PayloadTag::Handshake, bytes);
-        let pkt = Packet::new(1, 0, rand::rng().random(), payload);
+        let pkt = Packet::new(0, rand::rng().random(), payload);
         let _ = self.out_tx.send((pkt, dest));
 
         Ok(())

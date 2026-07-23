@@ -11,9 +11,10 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use dht::node_id::NodeID;
-use identity::identity::MasterKeyPair;
+use identity::certificates::DeviceCertificate;
+use identity::identity::{MasterKeyPair, UserID};
 use identity::keychain::Keychain;
 use network::registry::{self, RelayEntry, RelayRegistry};
 use network::relay::RelayFrame;
@@ -29,7 +30,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 fn relay_wrap(dest_id: u128, inner_packet: &Packet) -> Packet {
     let frame = RelayFrame::new(dest_id, inner_packet.serialize());
     let payload = Payload::new(PayloadTag::RelayFrame, frame.serialize());
-    Packet::new(1, 0, rand::rng().random(), payload)
+    Packet::new(0, rand::rng().random(), payload)
 }
 
 fn main() {
@@ -49,6 +50,20 @@ fn main() {
     println!("[bob] device mnemonic: {}", bob_mnemonic);
 
     let bob_device_pub = PublicKey::from(&StaticSecret::from(bob_keychain.device_x25519_priv));
+
+    // ----- device certificates -----
+    let alice_cert = DeviceCertificate::new(
+        &alice_master,
+        VerifyingKey::from_bytes(&alice_keychain.device_ed25519_pub).unwrap(),
+        PublicKey::from(alice_keychain.device_x25519_pub),
+    );
+    let bob_cert = DeviceCertificate::new(
+        &bob_master,
+        VerifyingKey::from_bytes(&bob_keychain.device_ed25519_pub).unwrap(),
+        PublicKey::from(bob_keychain.device_x25519_pub),
+    );
+    let alice_user_id = UserID::from(&alice_master);
+    let bob_user_id = UserID::from(&bob_master);
 
     // ----- relay IDs -----
     let alice_id = registry::derive_id(&alice_master.public_key.to_bytes());
@@ -132,11 +147,13 @@ fn main() {
         let mut session = Session::new_initiator(
             &alice_keychain.device_x25519_priv,
             bob_device_pub.as_bytes(),
+            alice_cert,
+            bob_user_id,
         ).unwrap();
 
         let msg1 = session.initiate_handshake().unwrap();
         let hp = Payload::new(PayloadTag::Handshake, msg1);
-        let hpkt = Packet::new(1, 0, rand::rng().random(), hp);
+        let hpkt = Packet::new(0, rand::rng().random(), hp);
         udp.send_to(&relay_wrap(bob_id, &hpkt), relay_addr).unwrap();
 
         let (resp, _) = udp.recv_from().unwrap();
@@ -157,16 +174,22 @@ fn main() {
 
     let bob_thread = thread::spawn(move || {
         let udp = UdpTransport::bind(bob_addr).unwrap();
-        let mut session = Session::new_responder(&bob_keychain.device_x25519_priv).unwrap();
+        let mut session = Session::new_responder(
+            &bob_keychain.device_x25519_priv,
+            bob_cert,
+        ).unwrap();
 
         let (pkt, _) = udp.recv_from().unwrap();
         session.accept_handshake(&pkt.payload.data).unwrap();
 
         let msg2 = session.reply_handshake().unwrap();
         let hp = Payload::new(PayloadTag::Handshake, msg2);
-        let hpkt = Packet::new(1, 0, rand::rng().random(), hp);
+        let hpkt = Packet::new(0, rand::rng().random(), hp);
         udp.send_to(&relay_wrap(alice_id, &hpkt), relay_addr).unwrap();
-        println!("[bob] handshake complete");
+
+        // verify Alice's device certificate against her master identity
+        assert!(session.verify_peer(&alice_user_id), "alice's cert should be valid");
+        println!("[bob] handshake complete (cert verified)");
 
         let (mpkt, _) = udp.recv_from().unwrap();
         let received = session.receive(&mpkt).unwrap();

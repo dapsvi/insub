@@ -8,6 +8,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 use crate::protocol::packet::{flag_to_int, Packet, PacketFlag, PacketFlags};
 use crate::protocol::payload::{Payload, PayloadTag};
+use crate::transport::fragment::{self, Reassembler};
 
 const MAX_RETRIES: u8 = 5;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -28,6 +29,7 @@ pub struct ReliableTransport {
     recv_rx: mpsc::Receiver<(Packet, SocketAddr)>,
     signing_key: Option<SigningKey>,
     peer_keys: Arc<Mutex<HashMap<SocketAddr, VerifyingKey>>>,
+    reassembler: Arc<Mutex<Reassembler>>,
 }
 
 impl ReliableTransport {
@@ -40,6 +42,8 @@ impl ReliableTransport {
         let pending_clone = pending.clone();
         let peer_keys = Arc::new(Mutex::new(HashMap::<SocketAddr, VerifyingKey>::new()));
         let peer_keys_clone = peer_keys.clone();
+        let reassembler = Arc::new(Mutex::new(Reassembler::new()));
+        let reassembler_clone = reassembler.clone();
 
         recv_socket.set_read_timeout(Some(RECV_TIMEOUT))?;
 
@@ -54,10 +58,19 @@ impl ReliableTransport {
             loop {
                 match recv_socket.recv_from(&mut buf) {
                     Ok((len, sender)) => {
-                        let packet = match Packet::from_serialized(buf[..len].to_vec()) {
+                        let mut packet = match Packet::from_serialized(buf[..len].to_vec()) {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
+
+                        // reassemble fragments before anything else
+                        if packet.payload.fragment_id != 0 {
+                            let mut reasm = reassembler_clone.lock().unwrap();
+                            packet = match reasm.feed(&packet, sender) {
+                                Some(complete) => complete,
+                                None => continue, // fragment stored, not complete yet
+                            };
+                        }
 
                         if packet.header.flags.contains(PacketFlag::Ack) {
                             let mut pending = pending_clone.lock().unwrap();
@@ -117,6 +130,8 @@ impl ReliableTransport {
                             }
                             true
                         });
+                        // drop stale fragment reassemblies
+                        reassembler_clone.lock().unwrap().evict_stale();
                     }
                     Err(_) => break,
                 }
@@ -129,33 +144,31 @@ impl ReliableTransport {
             recv_rx: rx,
             signing_key,
             peer_keys,
+            reassembler,
         })
     }
 
-    // send a Packet reliably (sets AckRequired)
+    // send a Packet reliably (sets AckRequired) and fragments large packets
     pub fn send(&self, packet: &Packet, dest: SocketAddr) -> Result<(), std::io::Error> {
-        let mut flags = packet.header.flags.to_int();
-        flags |= flag_to_int(PacketFlag::AckRequired);
+        for mut frag in fragment::split_packet(packet) {
+            // add AckRequired to each fragment
+            let mut flags = frag.header.flags.to_int();
+            flags |= flag_to_int(PacketFlag::AckRequired);
+            frag.header.flags = PacketFlags::from_int(flags);
 
-        let reliable_packet = Packet::new(
-            packet.header.version,
-            flags,
-            packet.header.id,
-            packet.payload.clone(),
-        );
+            let serialized = frag.serialize();
+            self.socket.send_to(&serialized, dest)?;
 
-        let serialized = reliable_packet.serialize();
-        self.socket.send_to(&serialized, dest)?;
-
-        self.pending.lock().unwrap().insert(
-            packet.header.id,
-            Pending {
-                serialized,
-                dest,
-                retries: 0,
-                last_sent: Instant::now(),
-            },
-        );
+            self.pending.lock().unwrap().insert(
+                frag.header.id,
+                Pending {
+                    serialized,
+                    dest,
+                    retries: 0,
+                    last_sent: Instant::now(),
+                },
+            );
+        }
 
         Ok(())
     }
@@ -176,7 +189,6 @@ impl ReliableTransport {
         };
         let ack_flags = PacketFlags::from_int(flag_to_int(PacketFlag::Ack));
         let ack = Packet::new(
-            1,
             ack_flags.to_int(),
             id,
             Payload::new(PayloadTag::KeepAlive, payload),

@@ -14,7 +14,7 @@ pub struct HandshakeResult {
     pub transport: TransportState,
     pub handshake_hash: [u8; 32],
     pub remote_static: [u8; 32],
-    pub peer_ratchet_pub: Vec<u8>,
+    pub peer_payload: Vec<u8>,
 }
 
 impl Initiator {
@@ -67,11 +67,11 @@ impl Initiator {
             .take()
             .ok_or("handshake already completed")?;
 
-        let mut peer_ratchet_pub = vec![0u8; 1024];
+        let mut peer_payload = vec![0u8; 1024];
         let written = handshake
-            .read_message(response, &mut peer_ratchet_pub)
+            .read_message(response, &mut peer_payload)
             .map_err(|e| format!("handshake response failed: {e}"))?;
-        peer_ratchet_pub.truncate(written);
+        peer_payload.truncate(written);
 
         let handshake_hash = copy_handshake_hash(&handshake);
 
@@ -89,7 +89,7 @@ impl Initiator {
             transport,
             handshake_hash,
             remote_static,
-            peer_ratchet_pub,
+            peer_payload,
         })
     }
 }
@@ -164,7 +164,7 @@ impl Responder {
                 transport,
                 handshake_hash,
                 remote_static,
-                peer_ratchet_pub: Vec::new(),
+                peer_payload: Vec::new(),
             },
         ))
     }

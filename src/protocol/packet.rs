@@ -1,6 +1,8 @@
 use crate::protocol::payload::Payload;
 use crate::protocol::wire::take_bytes;
 
+pub const CURRENT_VERSION: u64 = 1;
+
 pub enum PacketFlag {
     AckRequired,        // 0x01
     Ack,                // 0x02
@@ -18,6 +20,7 @@ pub fn flag_to_int(flag: PacketFlag) -> u32 {
     int
 }
 
+#[derive(Clone)]
 pub struct PacketFlags {
     pub flags: u32,
 }
@@ -40,21 +43,23 @@ impl PacketFlags {
     }
 }
 
+#[derive(Clone)]
 pub struct PacketHeader {
     pub version: u64,
     pub flags: PacketFlags,
     pub id: u128,
 }
 
+#[derive(Clone)]
 pub struct Packet {
     pub header: PacketHeader,
     pub payload: Payload,
 }
 
 impl Packet {
-    pub fn new(version: u64, flags: u32, id: u128, payload: Payload) -> Packet {
+    pub fn new(flags: u32, id: u128, payload: Payload) -> Packet {
         let header = PacketHeader {
-            version,
+            version: CURRENT_VERSION,
             flags: PacketFlags { flags },
             id,
         };
