@@ -29,7 +29,6 @@ pub struct ReliableTransport {
     recv_rx: mpsc::Receiver<(Packet, SocketAddr)>,
     signing_key: Option<SigningKey>,
     peer_keys: Arc<Mutex<HashMap<SocketAddr, VerifyingKey>>>,
-    reassembler: Arc<Mutex<Reassembler>>,
 }
 
 impl ReliableTransport {
@@ -144,7 +143,6 @@ impl ReliableTransport {
             recv_rx: rx,
             signing_key,
             peer_keys,
-            reassembler,
         })
     }
 
