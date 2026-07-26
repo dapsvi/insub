@@ -12,7 +12,7 @@ use crate::transport::fragment::{self, Reassembler};
 
 const MAX_RETRIES: u8 = 5;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
-const RECV_TIMEOUT: Duration = Duration::from_millis(500);
+const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
 struct Pending {
     serialized: Vec<u8>,

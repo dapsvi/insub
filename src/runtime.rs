@@ -16,8 +16,8 @@ use crate::dht::protocol::DhtOperation;
 use crate::dht::record::contact::ContactRecord;
 use crate::dht::record::record::{Record, RecordTag};
 use crate::dht::routing::RoutingTable;
-use crate::network::registry::RelayRegistry;
-use crate::network::relay::RelayForwarder;
+use crate::network::registry::{self, RelayRegistry};
+use crate::network::relay::{RelayForwarder, RelayFrame};
 use crate::identity::certificates::DeviceCertificate;
 use crate::identity::identity::UserID;
 use crate::protocol::message::Message;
@@ -86,6 +86,9 @@ pub struct Runtime {
     master_pubkey: Option<[u8; 32]>,
     device_cert: Option<DeviceCertificate>,
     peer_keys: Arc<Mutex<HashMap<SocketAddr, VerifyingKey>>>,
+
+    relay_addr: Option<SocketAddr>,
+    peer_master_pubkey: Option<[u8; 32]>,
 }
 
 impl Runtime {
@@ -152,6 +155,8 @@ impl Runtime {
             master_pubkey: None,
             device_cert: None,
             peer_keys,
+            relay_addr: None,
+            peer_master_pubkey: None,
         })
     }
 
@@ -171,6 +176,30 @@ impl Runtime {
         self.device_cert = Some(cert);
     }
 
+    pub fn set_relay(&mut self, addr: SocketAddr) {
+        self.relay_addr = Some(addr);
+    }
+
+    pub fn set_peer_master_pubkey(&mut self, pk: [u8; 32]) {
+        self.peer_master_pubkey = Some(pk);
+    }
+
+    // send a session packet through the relay
+    fn send_packet(&self, pkt: Packet) -> Result<(), String> {
+        let relay_addr = self.relay_addr.ok_or("relay not set")?;
+        let peer_pk = self.peer_master_pubkey.ok_or("peer master pubkey not set")?;
+        let relay_id = registry::derive_id(&peer_pk);
+
+        let frame = RelayFrame::new(relay_id, pkt.serialize());
+        let wrapped = Packet::new(
+            0,
+            rand::rng().random(),
+            Payload::new(PayloadTag::RelayFrame, frame.serialize()),
+        );
+        let _ = self.out_tx.send((wrapped, relay_addr));
+        Ok(())
+    }
+
     pub fn enable_session_initiator(
         &mut self,
         peer_device_x25519_pub: &[u8; 32],
@@ -178,10 +207,14 @@ impl Runtime {
         peer_user_id: UserID,
     ) -> Result<Receiver<Message>, String> {
         let (msg_tx, msg_rx) = mpsc::channel::<Message>();
+        let our_master_pubkey = self.master_pubkey
+            .ok_or("master pubkey not set")?;
+
         self.session = Some(Session::new_initiator(
             &self.device_x25519_priv,
             peer_device_x25519_pub,
             device_cert,
+            our_master_pubkey,
             peer_user_id,
         )?);
         self.msg_tx = Some(msg_tx);
@@ -388,7 +421,7 @@ impl Runtime {
         self.routing.evict_stale();
     }
 
-    fn tick_relay(&mut self) {
+    pub fn tick_relay(&mut self) {
         let fwd = match self.relay_fwd.as_ref() {
             Some(f) => f,
             None => return,
@@ -414,34 +447,46 @@ impl Runtime {
         self.ack_tx.send((id, dest))
     }
 
-    fn tick_handshake(&mut self) {
-        let session = match self.session.as_mut() {
-            Some(s) if !s.is_established() => s,
-            _ => return,            // no session or already done
-        };
-
+    pub fn tick_handshake(&mut self) {
         let (packet, sender) = match self.handshake_pile.pop_timeout(Duration::from_millis(100)) {
             Some(item) => item,
             None => return,
         };
 
-        if session.is_initiator() {
-            // we already called initiate_handshake, this packet is the response
-            let _ = session.complete_handshake(&packet.payload.data);
-        } else{
-            // we're the responder: accept the hello, send our reply
-            if session.accept_handshake(&packet.payload.data).is_ok() {
-                if let Ok(reply) = session.reply_handshake() {
-                    let payload = Payload::new(PayloadTag::Handshake, reply);
-                    let pkt = Packet::new(0, rand::rng().random(), payload);
-                    let _ = self.out_tx.send((pkt, sender));
+        // scope the session borrow so we can call self.send_packet later
+        let pending_reply: Option<Packet> = {
+            let session = match self.session.as_mut() {
+                Some(s) if !s.is_established() => s,
+                _ => return,
+            };
+
+            let mut reply_pkt = None;
+
+            if session.is_initiator() {
+                let _ = session.complete_handshake(&packet.payload.data);
+            } else {
+                if session.accept_handshake(&packet.payload.data).is_ok() {
+                    if let Some(pk) = session.peer_master_pubkey() {
+                        self.peer_master_pubkey = Some(pk);
+                    }
+                    if let Ok(reply) = session.reply_handshake() {
+                        let payload = Payload::new(PayloadTag::Handshake, reply);
+                        reply_pkt = Some(Packet::new(0, rand::rng().random(), payload));
+                    }
                 }
             }
-        }
 
-        // pin the peer's Ed25519 pubkey from the verified certificate
-        if let Some(cert) = session.peer_certificate() {
-            self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
+            // pin the peer's Ed25519 pubkey from the verified certificate
+            if let Some(cert) = session.peer_certificate() {
+                self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
+            }
+
+            reply_pkt
+        };
+
+        // send any deferred reply (session borrow is dropped)
+        if let Some(pkt) = pending_reply {
+            let _ = self.send_packet(pkt);
         }
 
         if packet.header.flags.contains(PacketFlag::AckRequired) {
@@ -449,19 +494,21 @@ impl Runtime {
         }
     }
 
-    pub fn initiate_handshake(&mut self, dest: SocketAddr) -> Result<(), String> {
+    pub fn session_established(&self) -> bool {
+        self.session.as_ref().map_or(false, |s| s.is_established())
+    }
+
+    pub fn initiate_handshake(&mut self) -> Result<(), String> {
         let bytes = self.session.as_mut()
             .unwrap()
             .initiate_handshake()?;
 
         let payload = Payload::new(PayloadTag::Handshake, bytes);
         let pkt = Packet::new(0, rand::rng().random(), payload);
-        let _ = self.out_tx.send((pkt, dest));
-
-        Ok(())
+        self.send_packet(pkt)
     }
 
-    fn tick_message(&mut self) {
+    pub fn tick_message(&mut self) {
         if self.session.is_none() {
             return
         }
@@ -484,12 +531,12 @@ impl Runtime {
         }
     }
 
-    pub fn send_message(&mut self, msg: Message, dest: SocketAddr) {
+    pub fn send_message(&mut self, msg: Message) {
         let pkt = match self.session.as_mut().unwrap().send(&msg) {
             Ok(p) => p,
             Err(_) => return,
         };
-        let _ = self.out_tx.send((pkt, dest));
+        let _ = self.send_packet(pkt);
     }
 }
 

@@ -20,8 +20,10 @@ pub struct Session {
     our_ratchet_dh_priv: Option<[u8; 32]>,
     their_ratchet_dh_pub: Option<[u8; 32]>,
     our_device_certificate: DeviceCertificate,
+    our_master_pubkey: Option<[u8; 32]>,
     peer_device_certificate: Option<DeviceCertificate>,
     peer_user_id: Option<UserID>,
+    peer_master_pubkey: Option<[u8; 32]>,
 }
 
 impl Session {
@@ -29,6 +31,7 @@ impl Session {
         our_device_x25519_priv: &[u8; 32],
         peer_device_x25519_pub: &[u8; 32],
         our_cert: DeviceCertificate,
+        our_master_pubkey: [u8; 32],
         peer_user_id: UserID,
     ) -> Result<Session, String> {
         let initiator = Initiator::new(our_device_x25519_priv, peer_device_x25519_pub)?;
@@ -42,24 +45,27 @@ impl Session {
             our_ratchet_dh_priv: None,
             their_ratchet_dh_pub: None,
             our_device_certificate: our_cert,
+            our_master_pubkey: Some(our_master_pubkey),
             peer_device_certificate: None,
             peer_user_id: Some(peer_user_id),
+            peer_master_pubkey: None,
         })
     }
 
     pub fn initiate_handshake(&mut self) -> Result<Vec<u8>, String> {
-        // generate the ratchet DH keypair so we can send the pubkey through the handshake payload
+        // payload: [ratchet_dh_pub (32)] [device_cert (128)] [master_pubkey (32)]
         let ratchet_secret = StaticSecret::random();
         let mut payload = PublicKey::from(&ratchet_secret).as_bytes().to_vec();
-        let our_cert = self.our_device_certificate.serialize();
-        payload.extend(our_cert.iter());
+        payload.extend(self.our_device_certificate.serialize().iter());
+        payload.extend_from_slice(&self.our_master_pubkey
+            .ok_or("master pubkey not set")?);
 
         self.our_ratchet_dh_priv = Some(*ratchet_secret.as_bytes());
 
         self.initiator
             .as_mut()
             .ok_or("Session is not an initiator")?
-            .initiate(payload.to_vec())
+            .initiate(payload)
     }
 
     pub fn complete_handshake(&mut self, response: &[u8]) -> Result<(), String> {
@@ -132,8 +138,10 @@ impl Session {
             our_ratchet_dh_priv: None,
             their_ratchet_dh_pub: None,
             our_device_certificate: our_cert,
+            our_master_pubkey: None,
             peer_device_certificate: None,
             peer_user_id: None,
+            peer_master_pubkey: None,
         })
     }
 
@@ -143,9 +151,9 @@ impl Session {
             .ok_or("Session is not a responder")?
             .accept(incoming)?;
 
-        // payload is [ratchet_dh_pub (32)] [device_certificate (128)]
-        if peer_payload.len() < 32 + 128 {
-            return Err("handshake payload too short for certificate".to_string());
+        // payload is [ratchet_dh_pub (32)] [device_certificate (128)] [master_pubkey (32)]
+        if peer_payload.len() < 32 + 128 + 32 {
+            return Err("handshake payload too short".to_string());
         }
 
         let pubkey: [u8; 32] = peer_payload[..32]
@@ -153,11 +161,17 @@ impl Session {
             .map_err(|_| "invalid ratchet pubkey length")?;
         self.their_ratchet_dh_pub = Some(pubkey);
 
-        let cert_bytes = peer_payload[32..].to_vec();
+        let cert_bytes = peer_payload[32..160].to_vec();
         let peer_cert = DeviceCertificate::from_serialized(cert_bytes)
             .map_err(|e| format!("bad peer device certificate: {e}"))?;
 
         self.peer_device_certificate = Some(peer_cert);
+
+        let master_pubkey: [u8; 32] = peer_payload[160..192]
+            .try_into()
+            .map_err(|_| "invalid master pubkey length")?;
+        self.peer_master_pubkey = Some(master_pubkey);
+
         Ok(())
     }
 
@@ -217,6 +231,10 @@ impl Session {
     // the Noise-authenticated remote static key (X25519), available after handshake
     pub fn peer_static(&self) -> Option<[u8; 32]> {
         self.remote_static
+    }
+
+    pub fn peer_master_pubkey(&self) -> Option<[u8; 32]> {
+        self.peer_master_pubkey
     }
 
     // the peer's device certificate, available after handshake
