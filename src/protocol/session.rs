@@ -173,6 +173,14 @@ impl Session {
             .ok_or("Session is not a responder")?
             .reply(ratchet_pub)?;
 
+        // the Noise-authenticated static key must match the certificate
+        let cert_x25519: [u8; 32] = *self.peer_device_certificate
+            .as_ref().unwrap()
+            .device_x25519_pubkey.as_bytes();
+        if cert_x25519 != result.remote_static {
+            return Err("peer certificate x25519 key doesn't match handshake".to_string());
+        }
+
         let root_key = derive_root_key(
             &result.handshake_hash,
             &self.our_ratchet_dh_priv.unwrap(),

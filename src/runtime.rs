@@ -1,11 +1,11 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, SendError};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngExt;
 use sha2::{Sha256, Digest};
 
@@ -85,11 +85,14 @@ pub struct Runtime {
 
     master_pubkey: Option<[u8; 32]>,
     device_cert: Option<DeviceCertificate>,
+    peer_keys: Arc<Mutex<HashMap<SocketAddr, VerifyingKey>>>,
 }
 
 impl Runtime {
     pub fn bind(id: NodeID, addr: SocketAddr, signing_key: Option<SigningKey>, device_x25519_priv: [u8; 32]) -> Result<Self, String> {
-        let transport = ReliableTransport::bind(addr, signing_key)
+        let peer_keys = Arc::new(Mutex::new(HashMap::<SocketAddr, VerifyingKey>::new()));
+
+        let transport = ReliableTransport::bind(addr, signing_key, peer_keys.clone())
             .map_err(|err| format!("Couldn't bind to address : {err}"))?;
 
         let dht_pile = PacketPile::new();
@@ -148,6 +151,7 @@ impl Runtime {
             msg_tx: None,
             master_pubkey: None,
             device_cert: None,
+            peer_keys,
         })
     }
 
@@ -433,6 +437,11 @@ impl Runtime {
                     let _ = self.out_tx.send((pkt, sender));
                 }
             }
+        }
+
+        // pin the peer's Ed25519 pubkey from the verified certificate
+        if let Some(cert) = session.peer_certificate() {
+            self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
         }
 
         if packet.header.flags.contains(PacketFlag::AckRequired) {

@@ -28,18 +28,20 @@ pub struct ReliableTransport {
     pending: Arc<Mutex<HashMap<u128, Pending>>>,
     recv_rx: mpsc::Receiver<(Packet, SocketAddr)>,
     signing_key: Option<SigningKey>,
-    peer_keys: Arc<Mutex<HashMap<SocketAddr, VerifyingKey>>>,
 }
 
 impl ReliableTransport {
     // Bind to a socket and start the recv thread.
     // signing_key is the local Ed25519 key used to sign outgoing Acks.
-    pub fn bind(addr: SocketAddr, signing_key: Option<SigningKey>) -> Result<Self, std::io::Error> {
+    pub fn bind(
+        addr: SocketAddr,
+        signing_key: Option<SigningKey>,
+        peer_keys: Arc<Mutex<HashMap<SocketAddr, VerifyingKey>>>,
+    ) -> Result<Self, std::io::Error> {
         let socket = UdpSocket::bind(addr)?;
         let recv_socket = socket.try_clone()?;
         let pending = Arc::new(Mutex::new(HashMap::<u128, Pending>::new()));
         let pending_clone = pending.clone();
-        let peer_keys = Arc::new(Mutex::new(HashMap::<SocketAddr, VerifyingKey>::new()));
         let peer_keys_clone = peer_keys.clone();
         let reassembler = Arc::new(Mutex::new(Reassembler::new()));
         let reassembler_clone = reassembler.clone();
@@ -142,7 +144,6 @@ impl ReliableTransport {
             pending,
             recv_rx: rx,
             signing_key,
-            peer_keys,
         })
     }
 
@@ -211,11 +212,6 @@ impl ReliableTransport {
         &self.socket
     }
 
-    // store the expected Ed25519 pubkey for a peer so that its signed Acks
-    // can be verified from the first exchange onward (avoids TOFU).
-    pub fn set_peer_pubkey(&self, addr: SocketAddr, pubkey: VerifyingKey) {
-        self.peer_keys.lock().unwrap().insert(addr, pubkey);
-    }
 }
 
 // examine an incoming Ack and decide whether to accept it.

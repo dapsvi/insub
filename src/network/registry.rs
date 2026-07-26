@@ -61,6 +61,10 @@ impl RelayEntry {
         let id = u128::from_be_bytes(id_bytes);
 
         let pubkey = take_bytes::<32>(&mut bytes)?;
+        let correct_id = derive_id(&pubkey);
+        if id != correct_id {
+            return Err("Invalid relay ID (does not match the public key)".to_string());
+        }
 
         if bytes.is_empty() {
             return Err("truncated relay entry: missing address marker".to_string());
@@ -124,6 +128,10 @@ impl RelayRegistry {
     pub fn from_serialized(mut bytes: Vec<u8>) -> Result<Self, String> {
         let count_bytes = take_bytes::<4>(&mut bytes)?;
         let count = u32::from_be_bytes(count_bytes) as usize;
+        let max_entries = bytes.len() / 55;
+        if count > max_entries {
+            return Err("entry count exceeds remaining bytes".to_string());
+        }
 
         let mut registry = Vec::with_capacity(count);
         for _ in 0..count {
