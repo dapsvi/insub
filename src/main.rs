@@ -25,7 +25,7 @@ use protocol::session::Session;
 use rand::RngExt;
 use runtime::Runtime;
 use transport::udp::UdpTransport;
-use x25519_dalek::{PublicKey, StaticSecret};
+use x25519_dalek::PublicKey;
 
 fn relay_wrap(dest_id: u128, inner_packet: &Packet) -> Packet {
     let frame = RelayFrame::new(dest_id, inner_packet.serialize());
@@ -49,8 +49,6 @@ fn main() {
     let bob_keychain = Keychain::load(Path::new("/tmp/insub-bob.keychain"), password).unwrap();
     println!("[bob] device mnemonic: {}", bob_mnemonic);
 
-    let bob_device_pub = PublicKey::from(&StaticSecret::from(bob_keychain.device_x25519_priv));
-
     // ----- device certificates -----
     let alice_cert = DeviceCertificate::new(
         &alice_master,
@@ -72,6 +70,8 @@ fn main() {
     let alice_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let bob_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let relay_addr: SocketAddr = "127.0.0.1:8070".parse().unwrap();
+    let alice_dht_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+    let bob_dht_addr: SocketAddr = "127.0.0.1:9003".parse().unwrap();
 
     // ----- DHT: multi-relay network -----
     println!("--- DHT multi-relay network ---");
@@ -103,11 +103,14 @@ fn main() {
         thread::sleep(Duration::from_millis(50));
     }
 
-    // leaf: join via relay 0, store and find
+    // leaf: join via relay 0, store and find. uses its own identity
+    // and runs a server so it stays reachable for later DHT lookups.
+    let (leaf_master, _) = MasterKeyPair::new();
     let leaf_addr: SocketAddr = "127.0.0.1:9100".parse().unwrap();
-    let leaf_id = NodeID::from_pubkey(&alice_master.public_key.to_bytes());
-    let leaf_sk = Some(SigningKey::from_bytes(&alice_master.to_bytes()));
+    let leaf_id = NodeID::from_pubkey(&leaf_master.public_key.to_bytes());
+    let leaf_sk = Some(SigningKey::from_bytes(&leaf_master.to_bytes()));
     let mut leaf = Runtime::bind(leaf_id, leaf_addr, leaf_sk, [0u8; 32]).unwrap();
+    leaf.enable_server();
     leaf.join(&[relay_addrs[0]]).unwrap();
     println!("[leaf] joined network");
 
@@ -123,11 +126,16 @@ fn main() {
     assert_eq!(found, Some(b"stored on the DHT network".to_vec()));
     println!("[leaf] found value back");
 
+    // keep the leaf serving so it stays reachable in the DHT routing table
+    let _leaf = thread::spawn(move || leaf.serve_forever());
+    thread::sleep(Duration::from_millis(50));
+
     println!("[dht] multi-relay tests passed");
 
-    // ----- relay forwarding + messaging -----
-    println!("--- messaging test ---");
+    // ----- relay forwarding + contact discovery + messaging -----
+    println!("--- contact discovery and messaging test ---");
 
+    // shared relay: DHT server (joins the network) + relay forwarding
     let mut registry = RelayRegistry::new();
     registry.add(
         RelayEntry::new(alice_id, alice_master.public_key.to_bytes(), alice_addr).unwrap(),
@@ -136,47 +144,65 @@ fn main() {
         RelayEntry::new(bob_id, bob_master.public_key.to_bytes(), bob_addr).unwrap(),
     );
 
-    let msg_relay_id = NodeID { id: [0u8; 32] };
-    let mut msg_relay = Runtime::bind(msg_relay_id, relay_addr, None, [0u8; 32]).unwrap();
+    let (msg_relay_master, _) = MasterKeyPair::new();
+    let msg_relay_id = NodeID::from_pubkey(&msg_relay_master.public_key.to_bytes());
+    let msg_relay_sk = Some(SigningKey::from_bytes(&msg_relay_master.to_bytes()));
+    let mut msg_relay = Runtime::bind(msg_relay_id, relay_addr, msg_relay_sk, [0u8; 32]).unwrap();
+    msg_relay.enable_server();
     msg_relay.enable_relay(registry);
+    msg_relay.join(&[relay_addrs[0]]).unwrap();
     let _relay = thread::spawn(move || msg_relay.serve_forever());
     thread::sleep(Duration::from_millis(100));
 
+    // Alice: DHT node that publishes her contact, then keeps serving
+    let alice_dht_sk = Some(SigningKey::from_bytes(&alice_master.to_bytes()));
+    let mut alice_dht = Runtime::bind(
+        NodeID::from_pubkey(&alice_master.public_key.to_bytes()),
+        alice_dht_addr,
+        alice_dht_sk,
+        alice_keychain.device_x25519_priv,
+    ).unwrap();
+    alice_dht.set_master_pubkey(alice_master.public_key.to_bytes());
+    alice_dht.set_device_cert(alice_cert.clone());
+    alice_dht.enable_server();
+    alice_dht.join(&[relay_addrs[0]]).unwrap();
+    alice_dht.publish_contact(relay_addr, alice_id, 300).unwrap();
+    println!("[alice] contact published");
+    let _alice_dht = thread::spawn(move || alice_dht.serve_forever());
+    thread::sleep(Duration::from_millis(50));
+
+    // Bob: DHT node, looks up Alice, then keeps serving
+    let bob_dht_sk = Some(SigningKey::from_bytes(&bob_master.to_bytes()));
+    let mut bob_dht = Runtime::bind(
+        NodeID::from_pubkey(&bob_master.public_key.to_bytes()),
+        bob_dht_addr,
+        bob_dht_sk,
+        bob_keychain.device_x25519_priv,
+    ).unwrap();
+    bob_dht.set_master_pubkey(bob_master.public_key.to_bytes());
+    bob_dht.set_device_cert(bob_cert.clone());
+    bob_dht.enable_server();
+    bob_dht.join(&[relay_addrs[0]]).unwrap();
+
+    let alice_contact = bob_dht.find_contact(&alice_master.public_key.to_bytes()).unwrap();
+    println!("[bob] found alice's contact (relay={})", alice_contact.relay_addr);
+
+    // verify the discovered cert matches what we expect
+    let cert_x25519: [u8; 32] = *alice_contact.device_cert.device_x25519_pubkey.as_bytes();
+    assert_eq!(cert_x25519, alice_keychain.device_x25519_pub);
+    assert!(alice_contact.device_cert.verify(&alice_user_id));
+    println!("[bob] alice's cert verified");
+
+    // Bob keeps serving DHT queries for other nodes
+    let _bob_dht = thread::spawn(move || bob_dht.serve_forever());
+    thread::sleep(Duration::from_millis(50));
+
+    // Messaging through relay using discovered contact info
     let alice_thread = thread::spawn(move || {
         let udp = UdpTransport::bind(alice_addr).unwrap();
-        let mut session = Session::new_initiator(
-            &alice_keychain.device_x25519_priv,
-            bob_device_pub.as_bytes(),
-            alice_cert,
-            bob_user_id,
-        ).unwrap();
-
-        let msg1 = session.initiate_handshake().unwrap();
-        let hp = Payload::new(PayloadTag::Handshake, msg1);
-        let hpkt = Packet::new(0, rand::rng().random(), hp);
-        udp.send_to(&relay_wrap(bob_id, &hpkt), relay_addr).unwrap();
-
-        let (resp, _) = udp.recv_from().unwrap();
-        session.complete_handshake(&resp.payload.data).unwrap();
-        println!("[alice] handshake complete");
-
-        let msg = Message::new("hello from alice".to_string(), None);
-        let mpkt = session.send(&msg).unwrap();
-        udp.send_to(&relay_wrap(bob_id, &mpkt), relay_addr).unwrap();
-
-        let (rpkt, _) = udp.recv_from().unwrap();
-        let reply = session.receive(&rpkt).unwrap();
-        println!("[alice] received: {}", reply.content);
-        assert_eq!(reply.reply_to.unwrap(), msg.id);
-
-        let _ = std::fs::remove_file("/tmp/insub-alice.keychain");
-    });
-
-    let bob_thread = thread::spawn(move || {
-        let udp = UdpTransport::bind(bob_addr).unwrap();
         let mut session = Session::new_responder(
-            &bob_keychain.device_x25519_priv,
-            bob_cert,
+            &alice_keychain.device_x25519_priv,
+            alice_cert,
         ).unwrap();
 
         let (pkt, _) = udp.recv_from().unwrap();
@@ -185,19 +211,49 @@ fn main() {
         let msg2 = session.reply_handshake().unwrap();
         let hp = Payload::new(PayloadTag::Handshake, msg2);
         let hpkt = Packet::new(0, rand::rng().random(), hp);
-        udp.send_to(&relay_wrap(alice_id, &hpkt), relay_addr).unwrap();
+        udp.send_to(&relay_wrap(bob_id, &hpkt), relay_addr).unwrap();
 
-        // verify Alice's device certificate against her master identity
-        assert!(session.verify_peer(&alice_user_id), "alice's cert should be valid");
-        println!("[bob] handshake complete (cert verified)");
+        // verify Bob's device certificate against his master identity
+        assert!(session.verify_peer(&bob_user_id), "bob's cert should be valid");
+        println!("[alice] handshake complete (cert verified)");
 
         let (mpkt, _) = udp.recv_from().unwrap();
         let received = session.receive(&mpkt).unwrap();
-        println!("[bob] received: {}", received.content);
+        println!("[alice] received: {}", received.content);
 
         let reply = Message::new("got it!".to_string(), Some(received.id));
         let rpkt = session.send(&reply).unwrap();
-        udp.send_to(&relay_wrap(alice_id, &rpkt), relay_addr).unwrap();
+        udp.send_to(&relay_wrap(bob_id, &rpkt), relay_addr).unwrap();
+
+        let _ = std::fs::remove_file("/tmp/insub-alice.keychain");
+    });
+
+    let bob_thread = thread::spawn(move || {
+        let udp = UdpTransport::bind(bob_addr).unwrap();
+        let mut session = Session::new_initiator(
+            &bob_keychain.device_x25519_priv,
+            alice_contact.device_x25519_pub(),
+            bob_cert,
+            alice_user_id,
+        ).unwrap();
+
+        let msg1 = session.initiate_handshake().unwrap();
+        let hp = Payload::new(PayloadTag::Handshake, msg1);
+        let hpkt = Packet::new(0, rand::rng().random(), hp);
+        udp.send_to(&relay_wrap(alice_contact.relay_id, &hpkt), alice_contact.relay_addr).unwrap();
+
+        let (resp, _) = udp.recv_from().unwrap();
+        session.complete_handshake(&resp.payload.data).unwrap();
+        println!("[bob] handshake complete");
+
+        let msg = Message::new("hello from bob".to_string(), None);
+        let mpkt = session.send(&msg).unwrap();
+        udp.send_to(&relay_wrap(alice_contact.relay_id, &mpkt), alice_contact.relay_addr).unwrap();
+
+        let (rpkt, _) = udp.recv_from().unwrap();
+        let reply = session.receive(&rpkt).unwrap();
+        println!("[bob] received: {}", reply.content);
+        assert_eq!(reply.reply_to.unwrap(), msg.id);
 
         let _ = std::fs::remove_file("/tmp/insub-bob.keychain");
     });

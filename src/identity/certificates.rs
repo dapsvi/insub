@@ -3,6 +3,7 @@ use x25519_dalek::PublicKey;
 
 use crate::identity::identity::{MasterKeyPair, UserID};
 
+#[derive(Clone)]
 pub struct DeviceCertificate {
     pub device_ed25519_pubkey: VerifyingKey,
     pub device_x25519_pubkey: PublicKey,

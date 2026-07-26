@@ -7,11 +7,14 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use rand::RngExt;
+use sha2::{Sha256, Digest};
 
 use crate::dht::client::DhtClient;
 use crate::dht::node::DhtNode;
 use crate::dht::node_id::NodeID;
 use crate::dht::protocol::DhtOperation;
+use crate::dht::record::contact::ContactRecord;
+use crate::dht::record::record::{Record, RecordTag};
 use crate::dht::routing::RoutingTable;
 use crate::network::registry::RelayRegistry;
 use crate::network::relay::RelayForwarder;
@@ -79,6 +82,9 @@ pub struct Runtime {
     out_tx: mpsc::Sender<(Packet, SocketAddr)>,
     ack_tx: mpsc::Sender<(u128, SocketAddr)>,
     msg_tx: Option<mpsc::Sender<Message>>,
+
+    master_pubkey: Option<[u8; 32]>,
+    device_cert: Option<DeviceCertificate>,
 }
 
 impl Runtime {
@@ -140,6 +146,8 @@ impl Runtime {
             out_tx,
             ack_tx,
             msg_tx: None,
+            master_pubkey: None,
+            device_cert: None,
         })
     }
 
@@ -149,6 +157,14 @@ impl Runtime {
 
     pub fn enable_relay(&mut self, registry: RelayRegistry) {
         self.relay_fwd = Some(RelayForwarder::new(registry));
+    }
+
+    pub fn set_master_pubkey(&mut self, pk: [u8; 32]) {
+        self.master_pubkey = Some(pk);
+    }
+
+    pub fn set_device_cert(&mut self, cert: DeviceCertificate) {
+        self.device_cert = Some(cert);
     }
 
     pub fn enable_session_initiator(
@@ -274,6 +290,42 @@ impl Runtime {
         }
 
         Ok(())
+    }
+
+    // contact records (DHT publish and lookup)
+
+    fn contact_key_for(master_pubkey: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"contact");
+        hasher.update(master_pubkey);
+        hasher.finalize().into()
+    }
+
+    pub fn publish_contact(
+        &mut self,
+        relay_addr: SocketAddr,
+        relay_id: u128,
+        ttl: u32,
+    ) -> Result<(), String> {
+        let cert = self.device_cert.as_ref()
+            .ok_or("device cert not set")?;
+        let contact = ContactRecord::new(cert.clone(), relay_addr, relay_id);
+        let record = Record::new(RecordTag::Contact, contact.serialize());
+        let master = self.master_pubkey
+            .ok_or("master pubkey not set")?;
+        let key = Self::contact_key_for(&master);
+        self.store(key, record.serialize(), ttl)
+    }
+
+    pub fn find_contact(&mut self, master_pubkey: &[u8; 32]) -> Result<ContactRecord, String> {
+        let key = Self::contact_key_for(master_pubkey);
+        let (value, _) = self.find_value(key)?;
+        let data = value.ok_or("no contact record found")?;
+        let record = Record::from_serialized(data)?;
+        if record.tag != RecordTag::Contact {
+            return Err("unexpected record type".to_string());
+        }
+        ContactRecord::from_serialized(record.data)
     }
 
     // pull from dht_pile until we get a response-type packet from the
