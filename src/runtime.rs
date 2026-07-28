@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, SendError};
 use std::sync::{mpsc, Arc, Mutex};
@@ -80,6 +80,7 @@ pub struct Runtime {
     pending_sessions: HashMap<[u8; 16], (Session, Option<[u8; 32]>)>,
     conn_to_pk: HashMap<[u8; 16], [u8; 32]>,
     pk_to_conn: HashMap<[u8; 32], [u8; 16]>,
+    seen_tags: HashSet<[u8; 16]>,
     device_x25519_priv: [u8; 32],
 
     out_tx: mpsc::Sender<(Packet, SocketAddr)>,
@@ -154,6 +155,7 @@ impl Runtime {
             pending_sessions: HashMap::new(),
             conn_to_pk: HashMap::new(),
             pk_to_conn: HashMap::new(),
+            seen_tags: HashSet::new(),
             device_x25519_priv,
             out_tx,
             ack_tx,
@@ -475,33 +477,12 @@ impl Runtime {
             }
         }
 
-        // if not found by tag, try pending responders (iterate)
         if promoted.is_none() {
-            let mut found_key = None;
-            for (key, (session, _peer_pk)) in self.pending_sessions.iter_mut() {
-                if session.is_initiator() {
-                    continue;
-                }
+            if self.seen_tags.contains(&tag) {
+                return;
+            }
+            if let Ok(mut session) = self.spawn_responder() {
                 if session.accept_handshake(&packet.payload.data).is_ok() {
-                    found_key = Some(*key);
-                    break;
-                }
-            }
-
-            if found_key.is_none() {
-                if let Ok(mut session) = self.spawn_responder() {
-                    if session.accept_handshake(&packet.payload.data).is_ok() {
-                        let k = rand::rng().random::<u128>();
-                        let mut key = [0u8; 16];
-                        key.copy_from_slice(&k.to_be_bytes());
-                        self.pending_sessions.insert(key, (session, None));
-                        found_key = Some(key);
-                    }
-                }
-            }
-
-            if let Some(key) = found_key {
-                if let Some((mut session, _)) = self.pending_sessions.remove(&key) {
                     let peer_pk = session.peer_master_pubkey().unwrap_or([0u8; 32]);
 
                     if let Ok(reply) = session.reply_handshake() {
@@ -518,6 +499,7 @@ impl Runtime {
                         self.conn_to_pk.insert(conn_id, peer_pk);
                         self.pk_to_conn.insert(peer_pk, conn_id);
                         self.sessions.insert(conn_id, session);
+                        self.seen_tags.insert(tag);
                     }
                 }
             }
