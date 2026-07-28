@@ -579,7 +579,10 @@ impl Runtime {
 
 
         let conn_id = packet.payload.connection_id;
-        let session = self.sessions.get_mut(&conn_id).unwrap();
+        let session = match self.sessions.get_mut(&conn_id) {
+            Some(s) => s,
+            None => return,
+        };
         let (msg, sender_pk) = match session.receive(&packet) {
             Ok(m) => m,
             Err(_) => return,
