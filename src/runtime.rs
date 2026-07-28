@@ -8,7 +8,6 @@ use std::time::Duration;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngExt;
 use sha2::{Sha256, Digest};
-
 use crate::dht::client::DhtClient;
 use crate::dht::node::DhtNode;
 use crate::dht::node_id::NodeID;
@@ -75,20 +74,24 @@ pub struct Runtime {
     relay_pile: PacketPile,
     handshake_pile: PacketPile,
     message_pile: PacketPile,
+
     relay_fwd: Option<RelayForwarder>,
-    session: Option<Session>,
+    sessions: HashMap<[u8; 16], Session>,
+    pending_sessions: HashMap<[u8; 16], (Session, Option<[u8; 32]>)>,
+    conn_to_pk: HashMap<[u8; 16], [u8; 32]>,
+    pk_to_conn: HashMap<[u8; 32], [u8; 16]>,
     device_x25519_priv: [u8; 32],
-    peer_pubkey: Option<[u8; 32]>,
+
     out_tx: mpsc::Sender<(Packet, SocketAddr)>,
     ack_tx: mpsc::Sender<(u128, SocketAddr)>,
-    msg_tx: Option<mpsc::Sender<Message>>,
+    msg_tx: mpsc::Sender<(Message, [u8; 32])>,
+    msg_rx: Option<mpsc::Receiver<(Message, [u8; 32])>>,
 
     master_pubkey: Option<[u8; 32]>,
     device_cert: Option<DeviceCertificate>,
     peer_keys: Arc<Mutex<HashMap<SocketAddr, VerifyingKey>>>,
 
     relay_addr: Option<SocketAddr>,
-    peer_master_pubkey: Option<[u8; 32]>,
 }
 
 impl Runtime {
@@ -104,6 +107,7 @@ impl Runtime {
         let message_pile = PacketPile::new();
         let (out_tx, out_rx) = mpsc::channel::<(Packet, SocketAddr)>();
         let (ack_tx, ack_rx) = mpsc::channel::<(u128, SocketAddr)>();
+        let (msg_tx, msg_rx) = mpsc::channel::<(Message, [u8; 32])>();
 
         // sorting thread: reads from transport, dispatches to piles.
         // also handles outbound sends and acks so the Runtime
@@ -146,17 +150,19 @@ impl Runtime {
             handshake_pile,
             message_pile,
             relay_fwd: None,
-            session: None,
+            sessions: HashMap::new(),
+            pending_sessions: HashMap::new(),
+            conn_to_pk: HashMap::new(),
+            pk_to_conn: HashMap::new(),
             device_x25519_priv,
-            peer_pubkey: None,
             out_tx,
             ack_tx,
-            msg_tx: None,
+            msg_tx,
+            msg_rx: Some(msg_rx),
             master_pubkey: None,
             device_cert: None,
             peer_keys,
             relay_addr: None,
-            peer_master_pubkey: None,
         })
     }
 
@@ -180,14 +186,13 @@ impl Runtime {
         self.relay_addr = Some(addr);
     }
 
-    pub fn set_peer_master_pubkey(&mut self, pk: [u8; 32]) {
-        self.peer_master_pubkey = Some(pk);
+    pub fn subscribe(&mut self) -> Receiver<(Message, [u8; 32])> {
+        self.msg_rx.take().expect("already subscribed")
     }
 
     // send a session packet through the relay
-    fn send_packet(&self, pkt: Packet) -> Result<(), String> {
+    fn send_packet(&self, pkt: Packet, peer_pk: [u8; 32]) -> Result<(), String> {
         let relay_addr = self.relay_addr.ok_or("relay not set")?;
-        let peer_pk = self.peer_master_pubkey.ok_or("peer master pubkey not set")?;
         let relay_id = registry::derive_id(&peer_pk);
 
         let frame = RelayFrame::new(relay_id, pkt.serialize());
@@ -205,34 +210,31 @@ impl Runtime {
         peer_device_x25519_pub: &[u8; 32],
         device_cert: DeviceCertificate,
         peer_user_id: UserID,
-    ) -> Result<Receiver<Message>, String> {
-        let (msg_tx, msg_rx) = mpsc::channel::<Message>();
+    ) -> Result<[u8; 16], String> {
         let our_master_pubkey = self.master_pubkey
             .ok_or("master pubkey not set")?;
 
-        self.session = Some(Session::new_initiator(
+        let peer_pk = peer_user_id.public_key.to_bytes();
+        let session = Session::new_initiator(
             &self.device_x25519_priv,
             peer_device_x25519_pub,
             device_cert,
             our_master_pubkey,
             peer_user_id,
-        )?);
-        self.msg_tx = Some(msg_tx);
-        self.peer_pubkey = Some(*peer_device_x25519_pub);
-        Ok(msg_rx)
+        )?;
+
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&rand::rng().random::<u128>().to_be_bytes());
+        self.pending_sessions.insert(tag, (session, Some(peer_pk)));
+        Ok(tag)
     }
 
-    pub fn enable_session_responder(
-        &mut self,
-        device_cert: DeviceCertificate,
-    ) -> Result<Receiver<Message>, String> {
-        let (msg_tx, msg_rx) = mpsc::channel::<Message>();
-        self.session = Some(Session::new_responder(
-            &self.device_x25519_priv,
-            device_cert,
-        )?);
-        self.msg_tx = Some(msg_tx);
-        Ok(msg_rx)
+    fn spawn_responder(&mut self) -> Result<Session, String> {
+        let cert = self.device_cert.clone()
+            .ok_or("device cert not set")?;
+        let master_pk = self.master_pubkey
+            .ok_or("master pubkey not set")?;
+        Session::new_responder(&self.device_x25519_priv, cert, master_pk)
     }
 
     // DHT section
@@ -453,40 +455,86 @@ impl Runtime {
             None => return,
         };
 
-        // scope the session borrow so we can call self.send_packet later
-        let pending_reply: Option<Packet> = {
-            let session = match self.session.as_mut() {
-                Some(s) if !s.is_established() => s,
-                _ => return,
-            };
+        let tag = packet.payload.connection_id;
 
-            let mut reply_pkt = None;
+        // try pending initiators first (look up by echoed tag)
+        let mut promoted = None;
+        let mut reply_pkt = None;
 
+        if let Some((session, peer_pk_opt)) = self.pending_sessions.get_mut(&tag) {
             if session.is_initiator() {
-                let _ = session.complete_handshake(&packet.payload.data);
-            } else {
-                if session.accept_handshake(&packet.payload.data).is_ok() {
-                    if let Some(pk) = session.peer_master_pubkey() {
-                        self.peer_master_pubkey = Some(pk);
+                if session.complete_handshake(&packet.payload.data).is_ok() {
+                    let conn_id = session.connection_id().unwrap_or([0u8; 16]);
+                    if tag != conn_id {
+                        // tag echoed back must match what we sent
                     }
-                    if let Ok(reply) = session.reply_handshake() {
-                        let payload = Payload::new(PayloadTag::Handshake, reply);
-                        reply_pkt = Some(Packet::new(0, rand::rng().random(), payload));
+                    if let Some(cert) = session.peer_certificate() {
+                        self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
+                    }
+                    let peer_pk = peer_pk_opt.ok_or("").unwrap_or([0u8; 32]);
+                    promoted = Some((tag, conn_id, peer_pk));
+                }
+            }
+        }
+
+        // if not found by tag, try pending responders (iterate)
+        if promoted.is_none() {
+            let mut found_key = None;
+            for (key, (session, _peer_pk)) in self.pending_sessions.iter_mut() {
+                if session.is_initiator() {
+                    continue;
+                }
+                if session.accept_handshake(&packet.payload.data).is_ok() {
+                    found_key = Some(*key);
+                    break;
+                }
+            }
+
+            if found_key.is_none() {
+                if let Ok(mut session) = self.spawn_responder() {
+                    if session.accept_handshake(&packet.payload.data).is_ok() {
+                        let k = rand::rng().random::<u128>();
+                        let mut key = [0u8; 16];
+                        key.copy_from_slice(&k.to_be_bytes());
+                        self.pending_sessions.insert(key, (session, None));
+                        found_key = Some(key);
                     }
                 }
             }
 
-            // pin the peer's Ed25519 pubkey from the verified certificate
-            if let Some(cert) = session.peer_certificate() {
-                self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
+            if let Some(key) = found_key {
+                if let Some((mut session, _)) = self.pending_sessions.remove(&key) {
+                    let peer_pk = session.peer_master_pubkey().unwrap_or([0u8; 32]);
+
+                    if let Ok(reply) = session.reply_handshake() {
+                        let mut payload = Payload::new(PayloadTag::Handshake, reply);
+                        payload.connection_id = tag;
+                        let pkt = Packet::new(0, rand::rng().random(), payload);
+                        reply_pkt = Some((pkt, peer_pk));
+                    }
+
+                    let conn_id = session.connection_id().unwrap_or([0u8; 16]);
+                    if let Some(cert) = session.peer_certificate() {
+                        self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
+                    }
+                    self.conn_to_pk.insert(conn_id, peer_pk);
+                    self.pk_to_conn.insert(peer_pk, conn_id);
+                    self.sessions.insert(conn_id, session);
+                }
             }
+        }
 
-            reply_pkt
-        };
+        if let Some((tag, conn_id, peer_pk)) = promoted {
+            if let Some((session, _)) = self.pending_sessions.remove(&tag) {
+                self.conn_to_pk.insert(conn_id, peer_pk);
+                self.pk_to_conn.insert(peer_pk, conn_id);
+                self.sessions.insert(conn_id, session);
+            }
+        }
 
-        // send any deferred reply (session borrow is dropped)
-        if let Some(pkt) = pending_reply {
-            let _ = self.send_packet(pkt);
+        // send any deferred reply
+        if let Some((pkt, peer_pk)) = reply_pkt {
+            let _ = self.send_packet(pkt, peer_pk);
         }
 
         if packet.header.flags.contains(PacketFlag::AckRequired) {
@@ -494,49 +542,61 @@ impl Runtime {
         }
     }
 
-    pub fn session_established(&self) -> bool {
-        self.session.as_ref().map_or(false, |s| s.is_established())
+    pub fn first_active_conn_id(&self) -> Option<[u8; 16]> {
+        for (conn_id, session) in &self.sessions {
+            if session.is_established() {
+                return Some(*conn_id);
+            }
+        }
+        None
     }
 
-    pub fn initiate_handshake(&mut self) -> Result<(), String> {
-        let bytes = self.session.as_mut()
-            .unwrap()
-            .initiate_handshake()?;
+    pub fn session_established(&self, conn_id: &[u8; 16]) -> bool {
+        self.sessions.get(conn_id).map_or(false, |s| s.is_established())
+    }
 
-        let payload = Payload::new(PayloadTag::Handshake, bytes);
+    pub fn initiate_handshake(&mut self, tag: [u8; 16]) -> Result<(), String> {
+        let (bytes, peer_pk) = {
+            let (session, peer_pk_opt) = self.pending_sessions.get_mut(&tag)
+                .ok_or("unknown pending tag")?;
+            let peer_pk = *peer_pk_opt.as_ref()
+                .ok_or("initiator must have peer_pk")?;
+            let bytes = session.initiate_handshake()?;
+            (bytes, peer_pk)
+        };
+
+        let mut payload = Payload::new(PayloadTag::Handshake, bytes);
+        payload.connection_id = tag;
         let pkt = Packet::new(0, rand::rng().random(), payload);
-        self.send_packet(pkt)
+        self.send_packet(pkt, peer_pk)
     }
 
     pub fn tick_message(&mut self) {
-        if self.session.is_none() {
-            return
-        }
-        if !self.session.as_ref().unwrap().is_established() {
-            return
-        }
-
         let (packet, sender) = match self.message_pile.pop_timeout(Duration::from_millis(100)) {
             Some(item) => item,
             None => return,
         };
-        let msg = match self.session.as_mut().unwrap().receive(&packet) {
+
+
+        let conn_id = packet.payload.connection_id;
+        let session = self.sessions.get_mut(&conn_id).unwrap();
+        let (msg, sender_pk) = match session.receive(&packet) {
             Ok(m) => m,
             Err(_) => return,
         };
-        let _ = self.msg_tx.as_ref().unwrap().send(msg);
+        let _ = self.msg_tx.send((msg, sender_pk));
 
         if packet.header.flags.contains(PacketFlag::AckRequired) {
             let _ = self.confirm(packet.header.id, sender);
         }
     }
 
-    pub fn send_message(&mut self, msg: Message) {
-        let pkt = match self.session.as_mut().unwrap().send(&msg) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        let _ = self.send_packet(pkt);
+    pub fn send_message(&mut self, msg: Message, peer_pk: [u8; 32]) -> Result<(), String> {
+        let conn_id = *self.pk_to_conn.get(&peer_pk)
+            .ok_or("no session for peer")?;
+        let pkt = self.sessions.get_mut(&conn_id).unwrap().send(&msg)
+            .map_err(|e| format!("session send: {e}"))?;
+        self.send_packet(pkt, peer_pk)
     }
 }
 

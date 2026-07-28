@@ -11,6 +11,14 @@ use crate::protocol::message::Message;
 use crate::protocol::packet::Packet;
 use crate::protocol::payload::{Payload, PayloadTag};
 
+fn derive_connection_id(handshake_hash: &[u8; 32]) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    Hkdf::<Sha256>::new(None, handshake_hash)
+        .expand(b"connection-id", &mut id)
+        .expect("HKDF expand failed");
+    id
+}
+
 pub struct Session {
     initiator: Option<Initiator>,
     responder: Option<Responder>,
@@ -24,6 +32,7 @@ pub struct Session {
     peer_device_certificate: Option<DeviceCertificate>,
     peer_user_id: Option<UserID>,
     peer_master_pubkey: Option<[u8; 32]>,
+    connection_id: Option<[u8; 16]>,
 }
 
 impl Session {
@@ -49,6 +58,7 @@ impl Session {
             peer_device_certificate: None,
             peer_user_id: Some(peer_user_id),
             peer_master_pubkey: None,
+            connection_id: None,
         })
     }
 
@@ -120,12 +130,16 @@ impl Session {
 
         self.handshake_hash = Some(result.handshake_hash);
         self.remote_static = Some(result.remote_static);
+
+        self.connection_id = Some(derive_connection_id(&result.handshake_hash));
+
         Ok(())
     }
 
     pub fn new_responder(
         our_device_x25519_priv: &[u8; 32],
         our_cert: DeviceCertificate,
+        our_master_pubkey: [u8; 32],
     ) -> Result<Self, String> {
         let responder = Responder::new(our_device_x25519_priv)?;
 
@@ -138,10 +152,11 @@ impl Session {
             our_ratchet_dh_priv: None,
             their_ratchet_dh_pub: None,
             our_device_certificate: our_cert,
-            our_master_pubkey: None,
+            our_master_pubkey: Some(our_master_pubkey),
             peer_device_certificate: None,
             peer_user_id: None,
             peer_master_pubkey: None,
+            connection_id: None,
         })
     }
 
@@ -209,7 +224,15 @@ impl Session {
         // responder does NOT call initiator_pre_ratchet: its first decrypt() triggers dh_ratchet_step, which catches up via DH commutativity and also prepares the sending chain for the reply
         self.handshake_hash = Some(result.handshake_hash);
         self.remote_static = Some(result.remote_static);
+
+        let conn_id = derive_connection_id(&result.handshake_hash);
+        self.connection_id = Some(conn_id);
+
         Ok(outgoing_message)
+    }
+
+    pub fn connection_id(&self) -> Option<[u8; 16]> {
+        self.connection_id
     }
 
     pub fn is_initiator(&self) -> bool {
@@ -243,28 +266,40 @@ impl Session {
     }
 
     pub fn send(&mut self, message: &Message) -> Result<Packet, String> {
-        let bytes = message.serialize()?;
+        let sender_pk = self.our_master_pubkey
+            .ok_or("master pubkey not set")?;
+
+        // prepend sender_pk to the message bytes, then encrypt together
+        let mut plaintext = Vec::with_capacity(32 + message.serialize()?.len());
+        plaintext.extend_from_slice(&sender_pk);
+        plaintext.extend_from_slice(&message.serialize()?);
+
         let (ciphertext, nonce, our_dh_pub) = self.ratchet
             .as_mut()
             .ok_or("Session not established")?
-            .encrypt(&bytes)
+            .encrypt(&plaintext)
             .map_err(|e| e.to_string())?;
+
+        let conn_id = self.connection_id
+            .ok_or("connection ID not set")?;
 
         let mut data = Vec::with_capacity(12 + 32 + ciphertext.len());
         data.extend_from_slice(&nonce);
         data.extend_from_slice(&our_dh_pub);
         data.extend_from_slice(&ciphertext);
 
-        let payload = Payload::new(PayloadTag::Message, data);
+        let mut payload = Payload::new(PayloadTag::Message, data);
+        payload.connection_id = conn_id;
 
         Ok(Packet::new(0, rand::rng().random(), payload))
     }
 
-    pub fn receive(&mut self, packet: &Packet) -> Result<Message, String> {
+    pub fn receive(&mut self, packet: &Packet) -> Result<(Message, [u8; 32]), String> {
         if packet.payload.tag != PayloadTag::Message {
             return Err(format!("expected Message payload, got {:?}", packet.payload.tag));
         }
 
+        // [nonce: 12] [dh_pub: 32] [ciphertext], where ciphertext decrypts to [sender_pk: 32] [message]
         if packet.payload.data.len() < 44 {
             return Err("packet too short".to_string());
         }
@@ -283,8 +318,17 @@ impl Session {
             .decrypt(their_dh_pub, &nonce, ciphertext)
             .map_err(|_| "Couldn't decrypt the message")?;
 
-        Message::from_serialized(plaintext)
-            .map_err(|e| e.to_string())
+        if plaintext.len() < 32 {
+            return Err("plaintext too short for sender pk".to_string());
+        }
+
+        let sender_pk: [u8; 32] = plaintext[..32]
+            .try_into()
+            .map_err(|_| "bad sender pk")?;
+        let msg = Message::from_serialized(plaintext[32..].to_vec())
+            .map_err(|e| e.to_string())?;
+
+        Ok((msg, sender_pk))
     }
 
     pub fn safety_number(

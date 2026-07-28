@@ -99,7 +99,8 @@ fn main() {
     println!("[alice] contact published");
 
     alice.set_relay(dht_addr);
-    let alice_msg_rx = alice.enable_session_responder(alice_cert).unwrap();
+    let alice_msg_rx = alice.subscribe();
+    let alice_pk = alice_master.public_key.to_bytes();
 
     // spawn Alice's pump thread BEFORE Bob joins so Alice can respond
     // to DHT queries from Bob's lookup
@@ -110,10 +111,12 @@ fn main() {
             alice.tick_handshake();
             alice.tick_message();
 
-            if let Ok(msg) = alice_msg_rx.try_recv() {
+            if let Ok((msg, sender_pk)) = alice_msg_rx.try_recv() {
                 println!("[alice] received: {}", msg.content);
                 let reply = Message::new("got it!".to_string(), Some(msg.id));
-                alice.send_message(reply);
+                if let Err(e) = alice.send_message(reply, sender_pk) {
+                    eprintln!("[alice] send_message FAILED: {}", e);
+                }
                 for _ in 0..5 {
                     alice.tick_server();
                     alice.tick_relay();
@@ -153,13 +156,13 @@ fn main() {
     println!("[bob] alice's cert verified");
 
     bob.set_relay(alice_contact.relay_addr);
-    bob.set_peer_master_pubkey(alice_master.public_key.to_bytes());
-    let bob_msg_rx = bob.enable_session_initiator(
+    let bob_msg_rx = bob.subscribe();
+    let bob_tag = bob.enable_session_initiator(
         alice_contact.device_x25519_pub(),
         bob_cert.clone(),
         alice_user_id,
     ).unwrap();
-    bob.initiate_handshake().unwrap();
+    bob.initiate_handshake(bob_tag).unwrap();
 
     // Bob: pump until session established, then send message and wait for reply
     let bob_thread = thread::spawn(move || {
@@ -171,20 +174,22 @@ fn main() {
             bob.tick_handshake();
             bob.tick_message();
 
-            if let Ok(msg) = bob_msg_rx.try_recv() {
+            if let Ok((msg, _sender_pk)) = bob_msg_rx.try_recv() {
                 println!("[bob] received: {}", msg.content);
                 break;
             }
 
-            if !sent && bob.session_established() {
+            if !sent && bob.first_active_conn_id().is_some() {
                 println!("[bob] session established, sending message");
                 let msg = Message::new("hello from bob".to_string(), None);
-                bob.send_message(msg);
+                if let Err(e) = bob.send_message(msg, alice_pk) {
+                    eprintln!("[bob] send_message FAILED: {}", e);
+                }
                 sent = true;
             }
             iteration += 1;
             if iteration % 50 == 0 {
-                println!("[bob] pump {} (established={})", iteration, bob.session_established());
+                println!("[bob] pump {} (active={})", iteration, bob.first_active_conn_id().is_some());
             }
             thread::sleep(Duration::from_millis(50));
         }

@@ -45,6 +45,7 @@ impl PayloadTag {
 #[derive(Clone)]
 pub struct Payload {
     pub tag: PayloadTag,
+    pub connection_id: [u8; 16],
     pub data: Vec<u8>,
     pub fragment_id: u128,
     pub fragment_index: u8,
@@ -53,16 +54,26 @@ pub struct Payload {
 
 impl Payload {
     pub fn new(tag: PayloadTag, data: Vec<u8>) -> Self {
-        Self { tag, data, fragment_id: 0, fragment_index: 0, fragment_total: 0 }
+        Self {
+            tag, data,
+            connection_id: [0u8; 16],
+            fragment_id: 0, fragment_index: 0, fragment_total: 0,
+        }
     }
 
-    pub fn new_fragment(tag: PayloadTag, data: Vec<u8>, fragment_id: u128, fragment_index: u8, fragment_total: u8) -> Self {
-        Self { tag, data, fragment_id, fragment_index, fragment_total}
+    pub fn new_fragment(tag: PayloadTag, data: Vec<u8>, fragment_id: u128,
+                        fragment_index: u8, fragment_total: u8) -> Self {
+        Self {
+            tag, data, fragment_id, fragment_index, fragment_total,
+            connection_id: [0u8; 16],
+        }
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(1 + 16 + 1 + 1 + self.data.len());
+        // [tag: 1] [conn_id: 16] [frag_id: 16] [frag_idx: 1] [frag_total: 1] [data]
+        let mut bytes = Vec::with_capacity(1 + 16 + 16 + 1 + 1 + self.data.len());
         bytes.push(self.tag.to_byte());
+        bytes.extend_from_slice(&self.connection_id);
         bytes.extend_from_slice(&self.fragment_id.to_be_bytes());
         bytes.push(self.fragment_index);
         bytes.push(self.fragment_total);
@@ -71,18 +82,19 @@ impl Payload {
     }
 
     pub fn from_serialized(bytes: Vec<u8>) -> Result<Self, String> {
-        if bytes.len() < 19 {
+        if bytes.len() < 35 {
             return Err("payload too short".to_string());
         }
         let tag_byte = bytes[0];
         let tag = PayloadTag::from_byte(tag_byte)
             .ok_or_else(|| format!("unknown payload tag: 0x{tag_byte:02x}"))?;
 
-        let fragment_id = u128::from_be_bytes(bytes[1..17].try_into().unwrap());
-        let fragment_index = bytes[17];
-        let fragment_total = bytes[18];
-        let data = bytes[19..].to_vec();
+        let connection_id: [u8; 16] = bytes[1..17].try_into().unwrap();
+        let fragment_id = u128::from_be_bytes(bytes[17..33].try_into().unwrap());
+        let fragment_index = bytes[33];
+        let fragment_total = bytes[34];
+        let data = bytes[35..].to_vec();
 
-        Ok(Payload { tag, data, fragment_id, fragment_index, fragment_total })
+        Ok(Payload { tag, connection_id, data, fragment_id, fragment_index, fragment_total })
     }
 }
