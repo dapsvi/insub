@@ -463,16 +463,14 @@ impl Runtime {
 
         if let Some((session, peer_pk_opt)) = self.pending_sessions.get_mut(&tag) {
             if session.is_initiator() {
-                if session.complete_handshake(&packet.payload.data).is_ok() {
-                    let conn_id = session.connection_id().unwrap_or([0u8; 16]);
-                    if tag != conn_id {
-                        // tag echoed back must match what we sent
+                if let Ok(()) = session.complete_handshake(&packet.payload.data) {
+                    if let Some(conn_id) = session.connection_id() {
+                        if let Some(cert) = session.peer_certificate() {
+                            self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
+                        }
+                        let peer_pk = peer_pk_opt.ok_or("").unwrap_or([0u8; 32]);
+                        promoted = Some((tag, conn_id, peer_pk));
                     }
-                    if let Some(cert) = session.peer_certificate() {
-                        self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
-                    }
-                    let peer_pk = peer_pk_opt.ok_or("").unwrap_or([0u8; 32]);
-                    promoted = Some((tag, conn_id, peer_pk));
                 }
             }
         }
@@ -513,13 +511,14 @@ impl Runtime {
                         reply_pkt = Some((pkt, peer_pk));
                     }
 
-                    let conn_id = session.connection_id().unwrap_or([0u8; 16]);
-                    if let Some(cert) = session.peer_certificate() {
-                        self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
+                    if let Some(conn_id) = session.connection_id() {
+                        if let Some(cert) = session.peer_certificate() {
+                            self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
+                        }
+                        self.conn_to_pk.insert(conn_id, peer_pk);
+                        self.pk_to_conn.insert(peer_pk, conn_id);
+                        self.sessions.insert(conn_id, session);
                     }
-                    self.conn_to_pk.insert(conn_id, peer_pk);
-                    self.pk_to_conn.insert(peer_pk, conn_id);
-                    self.sessions.insert(conn_id, session);
                 }
             }
         }
