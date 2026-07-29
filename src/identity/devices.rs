@@ -5,6 +5,7 @@ use crate::identity::identity::{UserID, MasterKeyPair};
 
 const MAX_DEVICES: usize = 5;
 
+#[derive(Clone)]
 pub struct DeviceList {
     pub sequence: u64,
     pub devices: Vec<DeviceCertificate>,

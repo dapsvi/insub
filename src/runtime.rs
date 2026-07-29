@@ -18,6 +18,7 @@ use crate::dht::routing::RoutingTable;
 use crate::network::registry::{self, RelayRegistry};
 use crate::network::relay::{RelayForwarder, RelayFrame};
 use crate::identity::certificates::DeviceCertificate;
+use crate::identity::devices::DeviceList;
 use crate::identity::identity::UserID;
 use crate::protocol::message::Message;
 use crate::protocol::payload::{Payload, PayloadTag};
@@ -210,7 +211,6 @@ impl Runtime {
             rand::rng().random(),
             Payload::new(PayloadTag::RelayFrame, frame.serialize()),
         );
-        eprintln!("Sending packet to {}", relay_addr);
         let _ = self.out_tx.send((wrapped, relay_addr));
         Ok(())
     }
@@ -369,13 +369,12 @@ impl Runtime {
 
     pub fn publish_contact(
         &mut self,
+        device_list: DeviceList,
         relay_addr: SocketAddr,
         relay_id: u128,
         ttl: u32,
     ) -> Result<(), String> {
-        let cert = self.device_cert.as_ref()
-            .ok_or("device cert not set")?;
-        let contact = ContactRecord::new(cert.clone(), relay_addr, relay_id);
+        let contact = ContactRecord::new(device_list, relay_addr, relay_id);
         let record = Record::new(RecordTag::Contact, contact.serialize());
         let master = self.master_pubkey
             .ok_or("master pubkey not set")?;
@@ -440,14 +439,7 @@ impl Runtime {
             match item {
                 Some((packet, sender)) => {
                     if self.server.is_some() {
-                        if let Ok(op) = DhtOperation::from_serialized(packet.payload.data.clone()) {
-                            match &op {
-                                DhtOperation::Ping { .. } => eprintln!("[dht] Ping from {sender}"),
-                                DhtOperation::FindNode { target_id, .. } => eprintln!("[dht] FindNode from {sender} for {:02x?}", &target_id.id[..4]),
-                                DhtOperation::FindValue { key, .. } => eprintln!("[dht] FindValue from {sender} for {:02x?}", &key[..4]),
-                                DhtOperation::Store { key, .. } => eprintln!("[dht] Store from {sender} for {:02x?}", &key[..4]),
-                                _ => {}
-                            }
+                        if let Ok(_op) = DhtOperation::from_serialized(packet.payload.data.clone()) {
                             if let Some(ref mut srv) = self.server {
                                 if let Some((response, dest)) = srv.process(&packet, sender, &mut self.routing) {
                                     self.send_dht_op(&response, dest);
@@ -520,8 +512,6 @@ impl Runtime {
 
         let tag: [u8; 16] = packet.payload.connection_id;
 
-        eprintln!("Received handshake packet from {}, tag {:?}", sender, &tag[..4]);
-
         // try pending initiators first (look up by echoed tag)
         let mut promoted = None;
         let mut reply_pkt: Option<(Packet, SocketAddr, [u8; 32])> = None;
@@ -529,7 +519,6 @@ impl Runtime {
         if let Some((session, peer_pk_opt)) = self.pending_sessions.get_mut(&tag) {
             if session.is_initiator() {
                 if let Ok(()) = session.complete_handshake(&packet.payload.data) {
-                    eprintln!("Handshake successfully completed as initiator");
                     if let Some(conn_id) = session.connection_id() {
                         if let Some(cert) = session.peer_certificate() {
                             self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
@@ -552,17 +541,14 @@ impl Runtime {
                     if let Some(addr) = session.peer_addr() {
                         self.pk_to_addr.insert(peer_pk, addr);
                     }
-                    eprintln!("Handshake successfully accepted as responder, peer pk {}, peer address {}", hex::encode(peer_pk), self.pk_to_addr[&peer_pk]);
 
                     if let Ok(reply) = session.reply_handshake() {
-                        eprintln!("preparing handshake reply...");
                         let mut payload = Payload::new(PayloadTag::Handshake, reply);
                         payload.connection_id = tag;
                         let pkt = Packet::new(0, rand::rng().random(), payload);
                         let addr = self.pk_to_addr.get(&peer_pk).copied()
                             .unwrap_or(sender);
                         reply_pkt = Some((pkt, addr, peer_pk));
-                        eprintln!("reply packet prepared");
                     }
 
                     if let Some(conn_id) = session.connection_id() {
@@ -627,7 +613,6 @@ impl Runtime {
         let addr = *self.pk_to_addr.get(&peer_pk)
             .ok_or("peer address not set")?;
         let relay_id = registry::derive_id(&peer_pk);
-        eprintln!("sending handshake to {}", addr);
         self.send_packet(pkt, addr, relay_id)
     }
 

@@ -229,7 +229,6 @@ impl Session {
     }
 
     pub fn reply_handshake(&mut self) -> Result<Vec<u8>, String> {
-        eprintln!("Preparing reply handshake data...");
         let ratchet_secret = StaticSecret::random();
         let mut ratchet_pub = PublicKey::from(&ratchet_secret).as_bytes().to_vec();
         ratchet_pub.extend(self.our_device_certificate.serialize().iter());
@@ -246,7 +245,6 @@ impl Session {
             .as_ref().unwrap()
             .device_x25519_pubkey.as_bytes();
         if cert_x25519 != result.remote_static {
-            eprintln!("Certificate mismatch : received {:?} and expected {:?}", result.remote_static, cert_x25519);
             return Err("peer certificate x25519 key doesn't match handshake".to_string());
         }
 

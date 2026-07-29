@@ -17,6 +17,7 @@ use std::time::Duration;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use dht::node_id::NodeID;
 use identity::certificates::DeviceCertificate;
+use identity::devices::DeviceList;
 use identity::identity::{MasterKeyPair, UserID};
 use identity::keychain::Keychain;
 use network::registry::{self, RelayEntry, RelayRegistry};
@@ -31,7 +32,6 @@ fn hex_pk(input: &str) -> Option<[u8; 32]> {
 }
 
 struct Peer {
-    tag: [u8; 16],
     pk: [u8; 32],
     conn_id: Option<[u8; 16]>,
 }
@@ -109,6 +109,10 @@ fn run_interactive() {
     let actual_addr = rt.local_addr();
     rt.enable_server();
     rt.set_master_pubkey(our_pk);
+
+    let mut device_list = DeviceList::new(&master);
+    device_list.add_device(&master, cert.clone()).ok();
+
     rt.set_device_cert(cert);
 
     eprintln!("creating the relay registry...");
@@ -132,9 +136,9 @@ fn run_interactive() {
         }
     }
     if !joined { return; }
-    match rt.publish_contact(actual_addr, our_id, 3600) {
+    match rt.publish_contact(device_list, actual_addr, our_id, 3600) {
         Err(e) => { eprintln!("could not publish contact: {e}") },
-        Ok(_) => { eprintln!("successfully published contact") },
+        Ok(_) => {},
     }
 
     println!("insub cli");
@@ -199,7 +203,7 @@ fn run_interactive() {
                     println!("\rlooking up {} ...", hex::encode(&pk[..4]));
                     match rt.find_contact(&pk) {
                         Ok(contact) => {
-                            let x25519 = *contact.device_x25519_pub();
+                            let x25519 = *contact.device_list.devices[0].device_x25519_pubkey.as_bytes();
                             let relay_addr = contact.relay_addr;
                             let peer_id = UserID { public_key: VerifyingKey::from_bytes(&pk).unwrap() };
                             rt.set_peer_addr(pk, relay_addr);
@@ -208,7 +212,7 @@ fn run_interactive() {
                                     if let Err(e) = rt.initiate_handshake(tag) {
                                         println!("\rhandshake failed: {e}");
                                     } else {
-                                        peers.insert(pk, Peer { tag, pk, conn_id: None });
+                                        peers.insert(pk, Peer { pk, conn_id: None });
                                         current = Some(pk);
                                         println!("\rhandshake sent to {}", hex::encode(&pk[..4]));
                                     }
