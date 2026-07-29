@@ -80,6 +80,7 @@ pub struct Runtime {
     pending_sessions: HashMap<[u8; 16], (Session, Option<[u8; 32]>)>,
     conn_to_pk: HashMap<[u8; 16], [u8; 32]>,
     pk_to_conn: HashMap<[u8; 32], [u8; 16]>,
+    pk_to_addr: HashMap<[u8; 32], SocketAddr>,
     seen_tags: HashSet<[u8; 16]>,
     device_x25519_priv: [u8; 32],
 
@@ -109,6 +110,7 @@ impl Runtime {
         let (out_tx, out_rx) = mpsc::channel::<(Packet, SocketAddr)>();
         let (ack_tx, ack_rx) = mpsc::channel::<(u128, SocketAddr)>();
         let (msg_tx, msg_rx) = mpsc::channel::<(Message, [u8; 32])>();
+        let actual_addr = transport.local_addr().unwrap_or(addr);
 
         // sorting thread: reads from transport, dispatches to piles.
         // also handles outbound sends and acks so the Runtime
@@ -145,7 +147,7 @@ impl Runtime {
             client: DhtClient::new(id),
             server: None,
             id,
-            address: addr,
+            address: actual_addr,
             dht_pile,
             relay_pile,
             handshake_pile,
@@ -155,6 +157,7 @@ impl Runtime {
             pending_sessions: HashMap::new(),
             conn_to_pk: HashMap::new(),
             pk_to_conn: HashMap::new(),
+            pk_to_addr: HashMap::new(),
             seen_tags: HashSet::new(),
             device_x25519_priv,
             out_tx,
@@ -192,11 +195,15 @@ impl Runtime {
         self.msg_rx.take().expect("already subscribed")
     }
 
-    // send a session packet through the relay
-    fn send_packet(&self, pkt: Packet, peer_pk: [u8; 32]) -> Result<(), String> {
-        let relay_addr = self.relay_addr.ok_or("relay not set")?;
-        let relay_id = registry::derive_id(&peer_pk);
+    pub fn local_addr(&self) -> SocketAddr {
+        self.address
+    }
 
+    pub fn set_peer_addr(&mut self, pk: [u8; 32], addr: SocketAddr) {
+        self.pk_to_addr.insert(pk, addr);
+    }
+
+    fn send_packet(&self, pkt: Packet, relay_addr: SocketAddr, relay_id: u128) -> Result<(), String> {
         let frame = RelayFrame::new(relay_id, pkt.serialize());
         let wrapped = Packet::new(
             0,
@@ -244,7 +251,13 @@ impl Runtime {
     pub fn join(&mut self, seeds: &[SocketAddr]) -> Result<(), String> {
         let mut next = self.client.start_join(seeds, &mut self.routing);
 
+        // only query the seed directly; skip iterative lookups that fan out
+        // to stale nodes lingering in the seed's routing table
+        let mut queries = 0;
         while let Some((op, addr)) = next {
+            if queries > 0 {
+                break;
+            }
             self.send_dht_op(&op, addr);
             let (response, sender) = self.recv_dht(addr)?;
             if let Some((_ping_id, ping_addr)) = self.routing.add_node(response.sender_id(), sender) {
@@ -259,6 +272,7 @@ impl Runtime {
             }
 
             next = maybe_next;
+            queries += 1;
         }
 
         Ok(())
@@ -267,7 +281,11 @@ impl Runtime {
     pub fn lookup_node(&mut self, target: NodeID) -> Result<Vec<(NodeID, SocketAddr)>, String> {
         let mut next = self.client.start_lookup_node(target, &self.routing);
 
+        let mut queries = 0;
         while let Some((op, addr)) = next {
+            if queries > 1 {
+                break;
+            }
             self.send_dht_op(&op, addr);
             let (response, sender) = self.recv_dht(addr)?;
             if let Some((_ping_id, ping_addr)) = self.routing.add_node(response.sender_id(), sender) {
@@ -282,6 +300,7 @@ impl Runtime {
             }
 
             next = maybe_next;
+            queries += 1;
         }
 
         let result = self.client.result().ok_or("no lookup result")?;
@@ -291,7 +310,11 @@ impl Runtime {
     pub fn find_value(&mut self, key: [u8; 32]) -> Result<(Option<Vec<u8>>, Vec<(NodeID, SocketAddr)>), String> {
         let mut next = self.client.start_find_value(key, &self.routing);
 
+        let mut queries = 0;
         while let Some((op, addr)) = next {
+            if queries > 2 {
+                break;
+            }
             self.send_dht_op(&op, addr);
             let (response, sender) = self.recv_dht(addr)?;
             if let Some((_ping_id, ping_addr)) = self.routing.add_node(response.sender_id(), sender) {
@@ -306,6 +329,7 @@ impl Runtime {
             }
 
             next = maybe_next;
+            queries += 1;
         }
 
         let result = self.client.result().ok_or("no lookup result")?;
@@ -410,16 +434,31 @@ impl Runtime {
     }
 
     pub fn tick_server(&mut self) {
-        let item = self.dht_pile.pop_timeout(Duration::from_millis(100));
-        if let Some((packet, sender)) = item {
-            let is_valid = DhtOperation::from_serialized(packet.payload.data.clone()).is_ok();
-            if let Some(ref mut srv) = self.server {
-                if let Some((response, dest)) = srv.process(&packet, sender, &mut self.routing) {
-                    self.send_dht_op(&response, dest);
+        loop {
+            let item = self.dht_pile.pop_timeout(Duration::from_millis(100));
+            match item {
+                Some((packet, sender)) => {
+                    if self.server.is_some() {
+                        if let Ok(op) = DhtOperation::from_serialized(packet.payload.data.clone()) {
+                            match &op {
+                                DhtOperation::Ping { .. } => eprintln!("[dht] Ping from {sender}"),
+                                DhtOperation::FindNode { target_id, .. } => eprintln!("[dht] FindNode from {sender} for {:02x?}", &target_id.id[..4]),
+                                DhtOperation::FindValue { key, .. } => eprintln!("[dht] FindValue from {sender} for {:02x?}", &key[..4]),
+                                DhtOperation::Store { key, .. } => eprintln!("[dht] Store from {sender} for {:02x?}", &key[..4]),
+                                _ => {}
+                            }
+                            if let Some(ref mut srv) = self.server {
+                                if let Some((response, dest)) = srv.process(&packet, sender, &mut self.routing) {
+                                    self.send_dht_op(&response, dest);
+                                }
+                            }
+                        }
+                    }
+                    if packet.header.flags.contains(PacketFlag::AckRequired) {
+                        let _ = self.confirm(packet.header.id, sender);
+                    }
                 }
-            }
-            if is_valid && packet.header.flags.contains(PacketFlag::AckRequired) {
-                let _ = self.confirm(packet.header.id, sender);
+                None => break,
             }
         }
         self.routing.evict_stale();
@@ -461,7 +500,7 @@ impl Runtime {
 
         // try pending initiators first (look up by echoed tag)
         let mut promoted = None;
-        let mut reply_pkt = None;
+        let mut reply_pkt: Option<(Packet, SocketAddr, [u8; 32])> = None;
 
         if let Some((session, peer_pk_opt)) = self.pending_sessions.get_mut(&tag) {
             if session.is_initiator() {
@@ -485,11 +524,17 @@ impl Runtime {
                 if session.accept_handshake(&packet.payload.data).is_ok() {
                     let peer_pk = session.peer_master_pubkey().unwrap_or([0u8; 32]);
 
+                    if let Some(addr) = session.peer_addr() {
+                        self.pk_to_addr.insert(peer_pk, addr);
+                    }
+
                     if let Ok(reply) = session.reply_handshake() {
                         let mut payload = Payload::new(PayloadTag::Handshake, reply);
                         payload.connection_id = tag;
                         let pkt = Packet::new(0, rand::rng().random(), payload);
-                        reply_pkt = Some((pkt, peer_pk));
+                        let addr = self.pk_to_addr.get(&peer_pk).copied()
+                            .unwrap_or(sender);
+                        reply_pkt = Some((pkt, addr, peer_pk));
                     }
 
                     if let Some(conn_id) = session.connection_id() {
@@ -497,7 +542,7 @@ impl Runtime {
                             self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
                         }
                         self.conn_to_pk.insert(conn_id, peer_pk);
-                        self.pk_to_conn.insert(peer_pk, conn_id);
+                        self.pk_to_conn.entry(peer_pk).or_insert(conn_id);
                         self.sessions.insert(conn_id, session);
                         self.seen_tags.insert(tag);
                     }
@@ -514,8 +559,9 @@ impl Runtime {
         }
 
         // send any deferred reply
-        if let Some((pkt, peer_pk)) = reply_pkt {
-            let _ = self.send_packet(pkt, peer_pk);
+        if let Some((pkt, addr, peer_pk)) = reply_pkt {
+            let relay_id = registry::derive_id(&peer_pk);
+            let _ = self.send_packet(pkt, addr, relay_id);
         }
 
         if packet.header.flags.contains(PacketFlag::AckRequired) {
@@ -537,19 +583,23 @@ impl Runtime {
     }
 
     pub fn initiate_handshake(&mut self, tag: [u8; 16]) -> Result<(), String> {
+        let our_addr = self.local_addr();
         let (bytes, peer_pk) = {
             let (session, peer_pk_opt) = self.pending_sessions.get_mut(&tag)
                 .ok_or("unknown pending tag")?;
             let peer_pk = *peer_pk_opt.as_ref()
                 .ok_or("initiator must have peer_pk")?;
-            let bytes = session.initiate_handshake()?;
+            let bytes = session.initiate_handshake(our_addr)?;
             (bytes, peer_pk)
         };
 
         let mut payload = Payload::new(PayloadTag::Handshake, bytes);
         payload.connection_id = tag;
         let pkt = Packet::new(0, rand::rng().random(), payload);
-        self.send_packet(pkt, peer_pk)
+        let addr = *self.pk_to_addr.get(&peer_pk)
+            .ok_or("peer address not set")?;
+        let relay_id = registry::derive_id(&peer_pk);
+        self.send_packet(pkt, addr, relay_id)
     }
 
     pub fn tick_message(&mut self) {
@@ -578,9 +628,12 @@ impl Runtime {
     pub fn send_message(&mut self, msg: Message, peer_pk: [u8; 32]) -> Result<(), String> {
         let conn_id = *self.pk_to_conn.get(&peer_pk)
             .ok_or("no session for peer")?;
+        let addr = *self.pk_to_addr.get(&peer_pk)
+            .ok_or("no address for peer")?;
+        let relay_id = registry::derive_id(&peer_pk);
         let pkt = self.sessions.get_mut(&conn_id).unwrap().send(&msg)
             .map_err(|e| format!("session send: {e}"))?;
-        self.send_packet(pkt, peer_pk)
+        self.send_packet(pkt, addr, relay_id)
     }
 }
 

@@ -207,7 +207,10 @@ impl ReliableTransport {
             .map_err(|_| "recv timed out or thread died".to_string())
     }
 
-    // expose the underlying socket for unreliable sends (handshake phase)
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
     pub fn socket(&self) -> &UdpSocket {
         &self.socket
     }

@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use hkdf::Hkdf;
 use rand::RngExt;
 use sha2::{Sha256, Digest};
@@ -32,6 +34,7 @@ pub struct Session {
     peer_device_certificate: Option<DeviceCertificate>,
     peer_user_id: Option<UserID>,
     peer_master_pubkey: Option<[u8; 32]>,
+    peer_addr: Option<SocketAddr>,
     connection_id: Option<[u8; 16]>,
 }
 
@@ -58,17 +61,29 @@ impl Session {
             peer_device_certificate: None,
             peer_user_id: Some(peer_user_id),
             peer_master_pubkey: None,
+            peer_addr: None,
             connection_id: None,
         })
     }
 
-    pub fn initiate_handshake(&mut self) -> Result<Vec<u8>, String> {
-        // payload: [ratchet_dh_pub (32)] [device_cert (128)] [master_pubkey (32)]
+    pub fn initiate_handshake(&mut self, our_addr: SocketAddr) -> Result<Vec<u8>, String> {
         let ratchet_secret = StaticSecret::random();
         let mut payload = PublicKey::from(&ratchet_secret).as_bytes().to_vec();
         payload.extend(self.our_device_certificate.serialize().iter());
         payload.extend_from_slice(&self.our_master_pubkey
             .ok_or("master pubkey not set")?);
+
+        match our_addr.ip() {
+            std::net::IpAddr::V4(v4) => {
+                payload.push(4);
+                payload.extend_from_slice(&v4.octets());
+            }
+            std::net::IpAddr::V6(v6) => {
+                payload.push(6);
+                payload.extend_from_slice(&v6.octets());
+            }
+        }
+        payload.extend_from_slice(&our_addr.port().to_be_bytes());
 
         self.our_ratchet_dh_priv = Some(*ratchet_secret.as_bytes());
 
@@ -156,6 +171,7 @@ impl Session {
             peer_device_certificate: None,
             peer_user_id: None,
             peer_master_pubkey: None,
+            peer_addr: None,
             connection_id: None,
         })
     }
@@ -166,8 +182,7 @@ impl Session {
             .ok_or("Session is not a responder")?
             .accept(incoming)?;
 
-        // payload is [ratchet_dh_pub (32)] [device_certificate (128)] [master_pubkey (32)]
-        if peer_payload.len() < 32 + 128 + 32 {
+        if peer_payload.len() < 32 + 128 + 32 + 7 {
             return Err("handshake payload too short".to_string());
         }
 
@@ -186,6 +201,29 @@ impl Session {
             .try_into()
             .map_err(|_| "invalid master pubkey length")?;
         self.peer_master_pubkey = Some(master_pubkey);
+
+        let addr_start = 192;
+        let addr_kind = peer_payload[addr_start];
+        let peer_addr = match addr_kind {
+            4 => {
+                if peer_payload.len() < addr_start + 7 {
+                    return Err("truncated addr".to_string());
+                }
+                let octets: [u8; 4] = peer_payload[addr_start+1..addr_start+5].try_into().unwrap();
+                let port = u16::from_be_bytes(peer_payload[addr_start+5..addr_start+7].try_into().unwrap());
+                SocketAddr::new(std::net::IpAddr::V4(octets.into()), port)
+            }
+            6 => {
+                if peer_payload.len() < addr_start + 19 {
+                    return Err("truncated addr".to_string());
+                }
+                let octets: [u8; 16] = peer_payload[addr_start+1..addr_start+17].try_into().unwrap();
+                let port = u16::from_be_bytes(peer_payload[addr_start+17..addr_start+19].try_into().unwrap());
+                SocketAddr::new(std::net::IpAddr::V6(octets.into()), port)
+            }
+            _ => return Err("unknown addr kind".to_string()),
+        };
+        self.peer_addr = Some(peer_addr);
 
         Ok(())
     }
@@ -244,7 +282,6 @@ impl Session {
     }
 
     // verify the peer's device certificate against a claimed master identity
-    // the responder calls this after the initiator's first message reveals their UserID
     pub fn verify_peer(&self, peer_id: &UserID) -> bool {
         self.peer_device_certificate
             .as_ref()
@@ -353,6 +390,10 @@ impl Session {
         let mut safety = [0u8; 32];
         safety.copy_from_slice(&result);
         Some(safety)
+    }
+
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        return self.peer_addr
     }
 }
 

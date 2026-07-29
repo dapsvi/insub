@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use crate::identity::certificates::DeviceCertificate;
 
 // published record telling peers how to reach this device through a relay and how to verify its handshake
+#[derive(Clone)]
 pub struct ContactRecord {
     // certificate linking this device's keys to the master identity
     pub device_cert: DeviceCertificate,
