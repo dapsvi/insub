@@ -210,6 +210,7 @@ impl Runtime {
             rand::rng().random(),
             Payload::new(PayloadTag::RelayFrame, frame.serialize()),
         );
+        eprintln!("Sending packet to {}", relay_addr);
         let _ = self.out_tx.send((wrapped, relay_addr));
         Ok(())
     }
@@ -465,17 +466,38 @@ impl Runtime {
     }
 
     pub fn tick_relay(&mut self) {
-        let fwd = match self.relay_fwd.as_ref() {
-            Some(f) => f,
+        if self.relay_fwd.is_none() {
+            return;
+        }
+        let item = self.relay_pile.pop_timeout(Duration::from_millis(100));
+        let (packet, sender) = match item {
+            Some(item) => item,
             None => return,
         };
-        let item = self.relay_pile.pop_timeout(Duration::from_millis(100));
-        if let Some((packet, sender)) = item {
-            if let Some((inner, dest)) = fwd.resolve(&packet) {
-                let _ = self.out_tx.send((inner, dest));
-                if fwd.should_confirm(&packet) {
+
+        if let Ok(frame) = RelayFrame::from_serialized(packet.payload.data.clone()) {
+            let my_id = self.master_pubkey.map(|pk| registry::derive_id(&pk));
+            if Some(frame.dest_id) == my_id {
+                if let Ok(inner) = Packet::from_serialized(frame.payload) {
+                    match inner.payload.tag {
+                        PayloadTag::DhtOperation => self.dht_pile.push((inner, sender)),
+                        PayloadTag::Handshake => self.handshake_pile.push((inner, sender)),
+                        PayloadTag::Message => self.message_pile.push((inner, sender)),
+                        _ => {}
+                    }
+                }
+                if packet.header.flags.contains(PacketFlag::AckRequired) {
                     let _ = self.confirm(packet.header.id, sender);
                 }
+                return;
+            }
+        }
+
+        let fwd = self.relay_fwd.as_ref().unwrap();
+        if let Some((inner, dest)) = fwd.resolve(&packet) {
+            let _ = self.out_tx.send((inner, dest));
+            if fwd.should_confirm(&packet) {
+                let _ = self.confirm(packet.header.id, sender);
             }
         }
     }
@@ -496,7 +518,9 @@ impl Runtime {
             None => return,
         };
 
-        let tag = packet.payload.connection_id;
+        let tag: [u8; 16] = packet.payload.connection_id;
+
+        eprintln!("Received handshake packet from {}, tag {:?}", sender, &tag[..4]);
 
         // try pending initiators first (look up by echoed tag)
         let mut promoted = None;
@@ -505,6 +529,7 @@ impl Runtime {
         if let Some((session, peer_pk_opt)) = self.pending_sessions.get_mut(&tag) {
             if session.is_initiator() {
                 if let Ok(()) = session.complete_handshake(&packet.payload.data) {
+                    eprintln!("Handshake successfully completed as initiator");
                     if let Some(conn_id) = session.connection_id() {
                         if let Some(cert) = session.peer_certificate() {
                             self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
@@ -527,14 +552,17 @@ impl Runtime {
                     if let Some(addr) = session.peer_addr() {
                         self.pk_to_addr.insert(peer_pk, addr);
                     }
+                    eprintln!("Handshake successfully accepted as responder, peer pk {}, peer address {}", hex::encode(peer_pk), self.pk_to_addr[&peer_pk]);
 
                     if let Ok(reply) = session.reply_handshake() {
+                        eprintln!("preparing handshake reply...");
                         let mut payload = Payload::new(PayloadTag::Handshake, reply);
                         payload.connection_id = tag;
                         let pkt = Packet::new(0, rand::rng().random(), payload);
                         let addr = self.pk_to_addr.get(&peer_pk).copied()
                             .unwrap_or(sender);
                         reply_pkt = Some((pkt, addr, peer_pk));
+                        eprintln!("reply packet prepared");
                     }
 
                     if let Some(conn_id) = session.connection_id() {
@@ -599,6 +627,7 @@ impl Runtime {
         let addr = *self.pk_to_addr.get(&peer_pk)
             .ok_or("peer address not set")?;
         let relay_id = registry::derive_id(&peer_pk);
+        eprintln!("sending handshake to {}", addr);
         self.send_packet(pkt, addr, relay_id)
     }
 
