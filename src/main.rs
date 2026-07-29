@@ -201,10 +201,9 @@ fn run_interactive() {
                         Ok(contact) => {
                             let x25519 = *contact.device_x25519_pub();
                             let relay_addr = contact.relay_addr;
-                            let peer_cert = contact.device_cert.clone();
                             let peer_id = UserID { public_key: VerifyingKey::from_bytes(&pk).unwrap() };
                             rt.set_peer_addr(pk, relay_addr);
-                            match rt.enable_session_initiator(&x25519, peer_cert, peer_id) {
+                            match rt.enable_session_initiator(&x25519, peer_id) {
                                 Ok(tag) => {
                                     if let Err(e) = rt.initiate_handshake(tag) {
                                         println!("\rhandshake failed: {e}");

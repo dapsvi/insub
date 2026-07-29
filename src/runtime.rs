@@ -218,13 +218,13 @@ impl Runtime {
     pub fn enable_session_initiator(
         &mut self,
         peer_device_x25519_pub: &[u8; 32],
-        device_cert: DeviceCertificate,
         peer_user_id: UserID,
     ) -> Result<[u8; 16], String> {
         let our_master_pubkey = self.master_pubkey
             .ok_or("master pubkey not set")?;
 
         let peer_pk = peer_user_id.public_key.to_bytes();
+        let device_cert = self.device_cert.clone().ok_or("No device certificate available".to_string())?;
         let session = Session::new_initiator(
             &self.device_x25519_priv,
             peer_device_x25519_pub,
