@@ -1,3 +1,5 @@
+use std::{fs, path::Path};
+
 use ed25519_dalek::{Signature, VerifyingKey};
 use x25519_dalek::PublicKey;
 
@@ -71,5 +73,10 @@ impl DeviceCertificate {
             device_x25519_pubkey,
             master_signature
         })
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let data = self.serialize();
+        fs::write(path, &data).map_err(|e| format!("failed to write device certificate: {e}"))
     }
 }

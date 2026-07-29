@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::{fs, net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6}, path::Path};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -150,6 +150,11 @@ impl RelayRegistry {
 
     pub fn remove(&mut self, id: u128) {
         self.registry.retain(|entry| entry.id != id);
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let data = self.serialize();
+        fs::write(path, &data).map_err(|e| format!("failed to write relay registry: {e}"))
     }
 }
 

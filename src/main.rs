@@ -5,6 +5,7 @@ pub mod transport;
 pub mod network;
 pub mod dht;
 pub mod runtime;
+pub mod storage;
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};

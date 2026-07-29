@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::mpsc::{Receiver, SendError};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -24,6 +25,7 @@ use crate::protocol::message::Message;
 use crate::protocol::payload::{Payload, PayloadTag};
 use crate::protocol::packet::{Packet, PacketFlag};
 use crate::protocol::session::Session;
+use crate::storage;
 use crate::transport::reliable::ReliableTransport;
 
 // FIFO queue shared between producer and consumer.
@@ -648,6 +650,62 @@ impl Runtime {
         let pkt = self.sessions.get_mut(&conn_id).unwrap().send(&msg)
             .map_err(|e| format!("session send: {e}"))?;
         self.send_packet(pkt, addr, relay_id)
+    }
+
+    // save peer-related state to a single file
+    // format: [peer_keys_len: u32][peer_keys_bytes][pk_to_addr_len: u32][pk_to_addr_bytes]
+    pub fn save_peer_state(&self, path: &Path) -> Result<(), String> {
+        use std::fs;
+        use std::io::Write;
+
+        let peer_keys_bytes = {
+            let map = self.peer_keys.lock().unwrap();
+            storage::serialize_peer_keys(&map)
+        };
+        let pk_to_addr_bytes = storage::serialize_pk_to_addr(&self.pk_to_addr);
+
+        let mut file = fs::File::create(path)
+            .map_err(|e| format!("cannot create peer state: {e}"))?;
+        file.write_all(&(peer_keys_bytes.len() as u32).to_be_bytes())
+            .map_err(|e| format!("write error: {e}"))?;
+        file.write_all(&peer_keys_bytes)
+            .map_err(|e| format!("write error: {e}"))?;
+        file.write_all(&(pk_to_addr_bytes.len() as u32).to_be_bytes())
+            .map_err(|e| format!("write error: {e}"))?;
+        file.write_all(&pk_to_addr_bytes)
+            .map_err(|e| format!("write error: {e}"))?;
+        Ok(())
+    }
+
+    pub fn load_peer_state(&mut self, path: &Path) -> Result<(), String> {
+        use std::fs;
+
+        let data = fs::read(path)
+            .map_err(|e| format!("cannot read peer state: {e}"))?;
+
+        if data.len() < 8 {
+            return Err("peer state file too short".to_string());
+        }
+
+        let peer_keys_len = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+        let cursor = 4 + peer_keys_len;
+        if data.len() < cursor + 4 {
+            return Err("truncated at pk_to_addr header".to_string());
+        }
+
+        let peer_keys = storage::deserialize_peer_keys(&data[4..4 + peer_keys_len])?;
+
+        let pk_to_addr_len = u32::from_be_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let start = cursor + 4;
+        if data.len() < start + pk_to_addr_len {
+            return Err("truncated at pk_to_addr body".to_string());
+        }
+        let pk_to_addr = storage::deserialize_pk_to_addr(&data[start..start + pk_to_addr_len])?;
+
+        *self.peer_keys.lock().unwrap() = peer_keys;
+        self.pk_to_addr = pk_to_addr;
+
+        Ok(())
     }
 }
 
