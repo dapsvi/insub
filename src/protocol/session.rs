@@ -9,7 +9,6 @@ use crate::crypto::handshake::{Initiator, Responder};
 use crate::crypto::ratchet::DoubleRatchet;
 use crate::identity::certificates::DeviceCertificate;
 use crate::identity::identity::UserID;
-use crate::protocol::message::Message;
 use crate::protocol::packet::Packet;
 use crate::protocol::payload::{Payload, PayloadTag};
 
@@ -302,14 +301,14 @@ impl Session {
         self.peer_device_certificate.as_ref()
     }
 
-    pub fn send(&mut self, message: &Message) -> Result<Packet, String> {
+    pub fn send(&mut self, bytes: &[u8]) -> Result<Packet, String> {
         let sender_pk = self.our_master_pubkey
             .ok_or("master pubkey not set")?;
 
         // prepend sender_pk to the message bytes, then encrypt together
-        let mut plaintext = Vec::with_capacity(32 + message.serialize()?.len());
+        let mut plaintext = Vec::with_capacity(32 + bytes.len());
         plaintext.extend_from_slice(&sender_pk);
-        plaintext.extend_from_slice(&message.serialize()?);
+        plaintext.extend_from_slice(bytes);
 
         let (ciphertext, nonce, our_dh_pub) = self.ratchet
             .as_mut()
@@ -331,7 +330,7 @@ impl Session {
         Ok(Packet::new(0, rand::rng().random(), payload))
     }
 
-    pub fn receive(&mut self, packet: &Packet) -> Result<(Message, [u8; 32]), String> {
+    pub fn receive(&mut self, packet: &Packet) -> Result<(Vec<u8>, [u8; 32]), String> {
         if packet.payload.tag != PayloadTag::Message {
             return Err(format!("expected Message payload, got {:?}", packet.payload.tag));
         }
@@ -362,10 +361,9 @@ impl Session {
         let sender_pk: [u8; 32] = plaintext[..32]
             .try_into()
             .map_err(|_| "bad sender pk")?;
-        let msg = Message::from_serialized(plaintext[32..].to_vec())
-            .map_err(|e| e.to_string())?;
+        let bytes = plaintext[32..].to_vec();
 
-        Ok((msg, sender_pk))
+        Ok((bytes, sender_pk))
     }
 
     pub fn safety_number(

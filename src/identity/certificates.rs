@@ -79,4 +79,9 @@ impl DeviceCertificate {
         let data = self.serialize();
         fs::write(path, &data).map_err(|e| format!("failed to write device certificate: {e}"))
     }
+
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let data = fs::read(path).map_err(|e| format!("failed to read device certificate: {e}"))?;
+        Ok(Self::from_serialized(data)?)
+    }
 }

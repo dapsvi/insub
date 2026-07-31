@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{identity::identity::MasterKeyPair, protocol::wire::take_bytes};
 
+#[derive(Clone)]
 pub struct RelayEntry {
     pub id: u128,
     pub pubkey: [u8; 32],
@@ -95,6 +96,7 @@ impl RelayEntry {
     }
 }
 
+#[derive(Clone)]
 pub struct RelayRegistry {
     registry: Vec<RelayEntry>,
 }
@@ -155,6 +157,11 @@ impl RelayRegistry {
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let data = self.serialize();
         fs::write(path, &data).map_err(|e| format!("failed to write relay registry: {e}"))
+    }
+
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let data = fs::read(path).map_err(|e| format!("failed to read relay registry: {e}"))?;
+        Ok(Self::from_serialized(data)?)
     }
 }
 

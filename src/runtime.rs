@@ -7,8 +7,9 @@ use std::thread;
 use std::time::Duration;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::RngExt;
+use rand::{RngExt, Rng};
 use sha2::{Sha256, Digest};
+use crate::crypto::cipher;
 use crate::dht::client::DhtClient;
 use crate::dht::node::DhtNode;
 use crate::dht::node_id::NodeID;
@@ -82,15 +83,18 @@ pub struct Runtime {
     sessions: HashMap<[u8; 16], Session>,
     pending_sessions: HashMap<[u8; 16], (Session, Option<[u8; 32]>)>,
     conn_to_pk: HashMap<[u8; 16], [u8; 32]>,
-    pk_to_conn: HashMap<[u8; 32], [u8; 16]>,
+    pk_to_conn: HashMap<[u8; 32], Vec<[u8; 16]>>,
     pk_to_addr: HashMap<[u8; 32], SocketAddr>,
     seen_tags: HashSet<[u8; 16]>,
+    received_keys: HashMap<[u8; 32], std::time::Instant>,
     device_x25519_priv: [u8; 32],
 
     out_tx: mpsc::Sender<(Packet, SocketAddr)>,
     ack_tx: mpsc::Sender<(u128, SocketAddr)>,
     msg_tx: mpsc::Sender<(Message, [u8; 32])>,
     msg_rx: Option<mpsc::Receiver<(Message, [u8; 32])>>,
+    sess_tx: mpsc::Sender<([u8; 32], [u8; 32])>,
+    sess_rx: Option<mpsc::Receiver<([u8; 32], [u8; 32])>>,
 
     master_pubkey: Option<[u8; 32]>,
     device_cert: Option<DeviceCertificate>,
@@ -113,6 +117,7 @@ impl Runtime {
         let (out_tx, out_rx) = mpsc::channel::<(Packet, SocketAddr)>();
         let (ack_tx, ack_rx) = mpsc::channel::<(u128, SocketAddr)>();
         let (msg_tx, msg_rx) = mpsc::channel::<(Message, [u8; 32])>();
+        let (sess_tx, sess_rx) = mpsc::channel::<([u8; 32], [u8; 32])>();
         let actual_addr = transport.local_addr().unwrap_or(addr);
 
         // sorting thread: reads from transport, dispatches to piles.
@@ -162,11 +167,14 @@ impl Runtime {
             pk_to_conn: HashMap::new(),
             pk_to_addr: HashMap::new(),
             seen_tags: HashSet::new(),
+            received_keys: HashMap::new(),
             device_x25519_priv,
             out_tx,
             ack_tx,
             msg_tx,
             msg_rx: Some(msg_rx),
+            sess_tx,
+            sess_rx: Some(sess_rx),
             master_pubkey: None,
             device_cert: None,
             peer_keys,
@@ -196,6 +204,17 @@ impl Runtime {
 
     pub fn subscribe(&mut self) -> Receiver<(Message, [u8; 32])> {
         self.msg_rx.take().expect("already subscribed")
+    }
+
+    pub fn subscribe_sessions(&mut self) -> Receiver<([u8; 32], [u8; 32])> {
+        self.sess_rx.take().expect("already subscribed")
+    }
+
+    pub fn tick(&mut self) {
+        self.tick_server();
+        self.tick_relay();
+        self.tick_handshake();
+        self.tick_message();
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -557,8 +576,11 @@ impl Runtime {
                         if let Some(cert) = session.peer_certificate() {
                             self.peer_keys.lock().unwrap().insert(sender, cert.device_ed25519_pubkey);
                         }
+                        let our_pk = self.master_pubkey.unwrap_or([0u8; 32]);
+                        let safety = session.safety_number(&our_pk, &peer_pk);
+                        let _ = self.sess_tx.send((peer_pk, safety.unwrap_or([0u8; 32])));
                         self.conn_to_pk.insert(conn_id, peer_pk);
-                        self.pk_to_conn.entry(peer_pk).or_insert(conn_id);
+                        self.pk_to_conn.entry(peer_pk).or_default().push(conn_id);
                         self.sessions.insert(conn_id, session);
                         self.seen_tags.insert(tag);
                     }
@@ -568,8 +590,11 @@ impl Runtime {
 
         if let Some((tag, conn_id, peer_pk)) = promoted {
             if let Some((session, _)) = self.pending_sessions.remove(&tag) {
+                let our_pk = self.master_pubkey.unwrap_or([0u8; 32]);
+                let safety = session.safety_number(&our_pk, &peer_pk);
+                let _ = self.sess_tx.send((peer_pk, safety.unwrap_or([0u8; 32])));
                 self.conn_to_pk.insert(conn_id, peer_pk);
-                self.pk_to_conn.insert(peer_pk, conn_id);
+                self.pk_to_conn.entry(peer_pk).or_default().push(conn_id);
                 self.sessions.insert(conn_id, session);
             }
         }
@@ -583,6 +608,20 @@ impl Runtime {
         if packet.header.flags.contains(PacketFlag::AckRequired) {
             let _ = self.confirm(packet.header.id, sender);
         }
+    }
+
+    pub fn active_conn_ids(&self) -> Vec<([u8; 16], [u8; 32])> {
+        self.sessions.iter()
+            .filter(|(_, s)| s.is_established())
+            .filter_map(|(conn_id, _)| {
+                let pk = *self.conn_to_pk.get(conn_id)?;
+                Some((*conn_id, pk))
+            })
+            .collect()
+    }
+
+    pub fn session_safety_number(&self, conn_id: &[u8; 16], our_pk: &[u8; 32], peer_pk: &[u8; 32]) -> Option<[u8; 32]> {
+        self.sessions.get(conn_id)?.safety_number(our_pk, peer_pk)
     }
 
     pub fn first_active_conn_id(&self) -> Option<[u8; 16]> {
@@ -624,16 +663,60 @@ impl Runtime {
             None => return,
         };
 
-
         let conn_id = packet.payload.connection_id;
-        let session = match self.sessions.get_mut(&conn_id) {
-            Some(s) => s,
-            None => return,
+
+        // decrypt inner bytes from the session ratchet
+        let (inner, sender_pk) = {
+            let session = match self.sessions.get_mut(&conn_id) {
+                Some(s) => s,
+                None => {
+                    self.remove_stale_conn(&conn_id);
+                    return;
+                }
+            };
+            match session.receive(&packet) {
+                Ok(m) => m,
+                Err(_) => {
+                    self.remove_stale_conn(&conn_id);
+                    return;
+                }
+            }
         };
-        let (msg, sender_pk) = match session.receive(&packet) {
+
+        // inner format: [key:32][nonce:12][ciphertext]
+        if inner.len() < 44 {
+            return;
+        }
+        let key: [u8; 32] = inner[..32].try_into().unwrap();
+        let nonce: [u8; 12] = inner[32..44].try_into().unwrap();
+
+        // dedup: hash(sender_pk || key) -> duplicates across devices are dropped
+        let mut hasher = Sha256::new();
+        hasher.update(&sender_pk);
+        hasher.update(&key);
+        let dedup_key: [u8; 32] = hasher.finalize().into();
+
+        let now = std::time::Instant::now();
+        if self.received_keys.contains_key(&dedup_key) {
+            if packet.header.flags.contains(PacketFlag::AckRequired) {
+                let _ = self.confirm(packet.header.id, sender);
+            }
+            return;
+        }
+
+        // prune stale dedup entries
+        self.received_keys.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
+
+        let plaintext = match cipher::decrypt(&inner[44..], &nonce, &key) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let msg = match Message::from_serialized(plaintext) {
             Ok(m) => m,
             Err(_) => return,
         };
+
+        self.received_keys.insert(dedup_key, now);
         let _ = self.msg_tx.send((msg, sender_pk));
 
         if packet.header.flags.contains(PacketFlag::AckRequired) {
@@ -641,15 +724,55 @@ impl Runtime {
         }
     }
 
+    fn remove_stale_conn(&mut self, conn_id: &[u8; 16]) {
+        self.sessions.remove(conn_id);
+        if let Some(pk) = self.conn_to_pk.remove(conn_id) {
+            if let Some(vec) = self.pk_to_conn.get_mut(&pk) {
+                vec.retain(|c| c != conn_id);
+                if vec.is_empty() {
+                    self.pk_to_conn.remove(&pk);
+                }
+            }
+        }
+    }
+
     pub fn send_message(&mut self, msg: Message, peer_pk: [u8; 32]) -> Result<(), String> {
-        let conn_id = *self.pk_to_conn.get(&peer_pk)
+        let conn_ids = self.pk_to_conn.get(&peer_pk)
             .ok_or("no session for peer")?;
         let addr = *self.pk_to_addr.get(&peer_pk)
             .ok_or("no address for peer")?;
         let relay_id = registry::derive_id(&peer_pk);
-        let pkt = self.sessions.get_mut(&conn_id).unwrap().send(&msg)
-            .map_err(|e| format!("session send: {e}"))?;
-        self.send_packet(pkt, addr, relay_id)
+
+        // encrypt body once with a random message key
+        let mut key = [0u8; 32];
+        rand::rng().fill_bytes(&mut key);
+        let (ciphertext, nonce) = cipher::encrypt(&msg.serialize()?, &key)?;
+
+        // inner format: [key:32][nonce:12][ciphertext]
+        let mut inner = Vec::with_capacity(32 + 12 + ciphertext.len());
+        inner.extend_from_slice(&key);
+        inner.extend_from_slice(&nonce);
+        inner.extend_from_slice(&ciphertext);
+
+        let mut sent = false;
+        for conn_id in conn_ids {
+            let session = match self.sessions.get_mut(conn_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            if !session.is_established() {
+                continue;
+            }
+            let pkt = session.send(&inner)
+                .map_err(|e| format!("session send: {e}"))?;
+            self.send_packet(pkt, addr, relay_id)?;
+            sent = true;
+        }
+
+        if !sent {
+            return Err("no active session for peer".to_string());
+        }
+        Ok(())
     }
 
     // save peer-related state to a single file

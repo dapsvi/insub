@@ -1,3 +1,6 @@
+use std::fs;
+use std::path::Path;
+
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::identity::certificates::DeviceCertificate;
@@ -133,5 +136,15 @@ impl DeviceList {
         self.master_signature = Self::sign_data(self.sequence, &self.devices, master);
 
         Ok(())
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let data = self.serialize();
+        fs::write(path, &data).map_err(|e| format!("failed to write device list: {e}"))
+    }
+
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let data = fs::read(path).map_err(|e| format!("failed to read device list: {e}"))?;
+        Ok(Self::from_serialized(data)?)
     }
 }
