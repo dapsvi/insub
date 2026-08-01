@@ -66,6 +66,7 @@ impl std::fmt::Debug for MasterKeyPair {
 
 
 // struct representing another user, we only have their public key
+#[derive(Clone, Copy)]
 pub struct UserID {
     pub public_key: VerifyingKey,
 }

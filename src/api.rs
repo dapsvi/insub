@@ -54,8 +54,6 @@ impl Client {
         let (master, mnemonic) = MasterKeyPair::new();
         let our_pk = master.public_key.to_bytes();
 
-        eprintln!("mnemonic: {}", mnemonic.to_string());
-
         let keychain = Keychain::from_mnemonic(&mnemonic, password);
         keychain.save(&storage_dir.join("keychain"), password)?;
 
@@ -77,7 +75,7 @@ impl Client {
         let mut rt = Runtime::bind(
             node_id,
             bind_addr,
-            Some(SigningKey::from_bytes(&master.to_bytes())),
+            Some(SigningKey::from_bytes(&keychain.device_ed25519_priv)),
             x25519_priv,
         )?;
 
@@ -286,17 +284,17 @@ impl Client {
         self.rt.lock().unwrap().save_peer_state(&self.storage_dir.join("peer_state"))
     }
 
-    pub fn add_device(&mut self, mnemonic: Mnemonic) -> Result<(), String> {
-        let master = MasterKeyPair::from_mnemonic(&mnemonic, None);
+    pub fn add_device(&mut self, mnemonic: Mnemonic, password: Option<&str>) -> Result<(), String> {
+        let master = MasterKeyPair::from_mnemonic(&mnemonic, password);
         let our_pk = master.public_key.to_bytes();
 
         if our_pk != self.our_pk {
             return Err("mnemonic does not match this identity".to_string());
         }
 
-        let keychain = Keychain::from_mnemonic(&mnemonic, None);
+        let keychain = Keychain::from_mnemonic(&mnemonic, password);
         let device_index = self.device_list.devices.len();
-        keychain.save(&self.storage_dir.join(format!("keychain_{device_index}")), None)?;
+        keychain.save(&self.storage_dir.join(format!("keychain_{device_index}")), password)?;
 
         let cert = DeviceCertificate::new(
             &master,
@@ -326,8 +324,8 @@ impl Client {
         list.save(&self.storage_dir.join("device_list"))
     }
 
-    pub fn revoke_device(&mut self, mnemonic: Mnemonic, index: usize) -> Result<(), String> {
-        let master = MasterKeyPair::from_mnemonic(&mnemonic, None);
+    pub fn revoke_device(&mut self, mnemonic: Mnemonic, index: usize, password: Option<&str>) -> Result<(), String> {
+        let master = MasterKeyPair::from_mnemonic(&mnemonic, password);
         let our_pk = master.public_key.to_bytes();
 
         if our_pk != self.our_pk {
@@ -398,18 +396,22 @@ impl Client {
 
     pub fn contact(&mut self, pk: [u8; 32]) -> Result<(), String> {
         let user_id = UserID {
-            public_key: VerifyingKey::from_bytes(&pk).unwrap(),
+            public_key: VerifyingKey::from_bytes(&pk)
+                .map_err(|_| "invalid public key".to_string())?,
         };
 
         let mut rt = self.rt.lock().unwrap();
         let contact = rt.find_contact(&pk)?;
 
-        let x25519 = *contact.device_list.devices[0].device_x25519_pubkey.as_bytes();
         let relay_addr = contact.relay_addr;
         rt.set_peer_addr(pk, relay_addr);
 
-        let tag = rt.enable_session_initiator(&x25519, user_id)?;
-        rt.initiate_handshake(tag)?;
+        // initiate a handshake with every active device
+        for device in &contact.device_list.devices {
+            let x25519 = *device.device_x25519_pubkey.as_bytes();
+            let tag = rt.enable_session_initiator(&x25519, user_id)?;
+            rt.initiate_handshake(tag)?;
+        }
 
         let peer_info = PeerInfo {
             pk,
