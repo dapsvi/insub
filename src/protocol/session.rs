@@ -310,7 +310,7 @@ impl Session {
         plaintext.extend_from_slice(&sender_pk);
         plaintext.extend_from_slice(bytes);
 
-        let (ciphertext, nonce, our_dh_pub) = self.ratchet
+        let (message_number, ciphertext, nonce, our_dh_pub) = self.ratchet
             .as_mut()
             .ok_or("Session not established")?
             .encrypt(&plaintext)
@@ -319,9 +319,10 @@ impl Session {
         let conn_id = self.connection_id
             .ok_or("connection ID not set")?;
 
-        let mut data = Vec::with_capacity(12 + 32 + ciphertext.len());
+        let mut data = Vec::with_capacity(12 + 32 + 4 + ciphertext.len());
         data.extend_from_slice(&nonce);
         data.extend_from_slice(&our_dh_pub);
+        data.extend_from_slice(&message_number.to_be_bytes());
         data.extend_from_slice(&ciphertext);
 
         let mut payload = Payload::new(PayloadTag::Message, data);
@@ -335,8 +336,9 @@ impl Session {
             return Err(format!("expected Message payload, got {:?}", packet.payload.tag));
         }
 
-        // [nonce: 12] [dh_pub: 32] [ciphertext], where ciphertext decrypts to [sender_pk: 32] [message]
-        if packet.payload.data.len() < 44 {
+        // [nonce: 12] [dh_pub: 32] [msg_num: 4 BE] [ciphertext]
+        // ciphertext decrypts to [sender_pk: 32] [message]
+        if packet.payload.data.len() < 48 {
             return Err("packet too short".to_string());
         }
 
@@ -346,12 +348,15 @@ impl Session {
         let their_dh_pub: [u8; 32] = packet.payload.data[12..44]
             .try_into()
             .map_err(|_| "bad DH public key")?;
-        let ciphertext = &packet.payload.data[44..];
+        let message_number = u32::from_be_bytes(
+            packet.payload.data[44..48].try_into().map_err(|_| "bad message number")?,
+        );
+        let ciphertext = &packet.payload.data[48..];
 
         let plaintext = self.ratchet
             .as_mut()
             .ok_or("Session not established")?
-            .decrypt(their_dh_pub, &nonce, ciphertext)
+            .decrypt(message_number, their_dh_pub, &nonce, ciphertext)
             .map_err(|_| "Couldn't decrypt the message")?;
 
         if plaintext.len() < 32 {

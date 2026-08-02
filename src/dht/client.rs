@@ -174,6 +174,29 @@ impl DhtClient {
         }
     }
 
+    pub fn skip_node(&mut self) -> (Option<(DhtOperation, SocketAddr)>, bool) {
+        let mut pending = match self.pending.take() {
+            Some(p) => p,
+            None => return (None, true),
+        };
+
+        let next = pending.next_query();
+        match next {
+            Some((_, addr)) => {
+                let op = match pending.find_value_key {
+                    Some(key) => DhtOperation::FindValue { sender_id: self.id, key },
+                    None => DhtOperation::FindNode { sender_id: self.id, target_id: pending.target },
+                };
+                self.pending = Some(pending);
+                (Some((op, addr)), false)
+            }
+            None => {
+                self.pending = Some(pending);
+                (None, true)
+            }
+        }
+    }
+
     pub fn result(&self) -> Option<&PendingLookup> {
         self.pending.as_ref()
     }

@@ -88,6 +88,7 @@ pub struct Runtime {
     seen_tags: HashSet<[u8; 16]>,
     received_keys: HashMap<[u8; 32], std::time::Instant>,
     device_x25519_priv: [u8; 32],
+    device_ed25519_priv: Option<SigningKey>,
 
     out_tx: mpsc::Sender<(Packet, SocketAddr)>,
     ack_tx: mpsc::Sender<(u128, SocketAddr)>,
@@ -107,6 +108,7 @@ impl Runtime {
     pub fn bind(id: NodeID, addr: SocketAddr, signing_key: Option<SigningKey>, device_x25519_priv: [u8; 32]) -> Result<Self, String> {
         let peer_keys = Arc::new(Mutex::new(HashMap::<SocketAddr, VerifyingKey>::new()));
 
+        let device_ed25519_priv = signing_key.clone();
         let transport = ReliableTransport::bind(addr, signing_key, peer_keys.clone())
             .map_err(|err| format!("Couldn't bind to address : {err}"))?;
 
@@ -169,6 +171,7 @@ impl Runtime {
             seen_tags: HashSet::new(),
             received_keys: HashMap::new(),
             device_x25519_priv,
+            device_ed25519_priv,
             out_tx,
             ack_tx,
             msg_tx,
@@ -273,15 +276,19 @@ impl Runtime {
     pub fn join(&mut self, seeds: &[SocketAddr]) -> Result<(), String> {
         let mut next = self.client.start_join(seeds, &mut self.routing);
 
-        // only query the seed directly; skip iterative lookups that fan out
-        // to stale nodes lingering in the seed's routing table
-        let mut queries = 0;
-        while let Some((op, addr)) = next {
-            if queries > 0 {
-                break;
-            }
+        while let Some((ref op, addr)) = next {
             self.send_dht_op(&op, addr);
-            let (response, sender) = self.recv_dht(addr)?;
+            let (response, sender) = match self.recv_dht(addr) {
+                Ok((resp, send)) => (resp, send),
+                Err(_) => {
+                    let (maybe_next, done) = self.client.skip_node();
+                    if done {
+                        break;
+                    }
+                    next = maybe_next;
+                    continue;
+                },
+            };
             if let Some((_ping_id, ping_addr)) = self.routing.add_node(response.sender_id(), sender) {
                 let ping = DhtOperation::Ping { sender_id: self.id };
                 self.send_dht_op(&ping, ping_addr);
@@ -294,7 +301,6 @@ impl Runtime {
             }
 
             next = maybe_next;
-            queries += 1;
         }
 
         Ok(())
@@ -303,13 +309,19 @@ impl Runtime {
     pub fn lookup_node(&mut self, target: NodeID) -> Result<Vec<(NodeID, SocketAddr)>, String> {
         let mut next = self.client.start_lookup_node(target, &self.routing);
 
-        let mut queries = 0;
-        while let Some((op, addr)) = next {
-            if queries > 1 {
-                break;
-            }
+        while let Some((ref op, addr)) = next {
             self.send_dht_op(&op, addr);
-            let (response, sender) = self.recv_dht(addr)?;
+            let (response, sender) = match self.recv_dht(addr) {
+                Ok((resp, send)) => (resp, send),
+                Err(_) => {
+                    let (maybe_next, done) = self.client.skip_node();
+                    if done {
+                        break;
+                    }
+                    next = maybe_next;
+                    continue;
+                },
+            };
             if let Some((_ping_id, ping_addr)) = self.routing.add_node(response.sender_id(), sender) {
                 let ping = DhtOperation::Ping { sender_id: self.id };
                 self.send_dht_op(&ping, ping_addr);
@@ -322,7 +334,6 @@ impl Runtime {
             }
 
             next = maybe_next;
-            queries += 1;
         }
 
         let result = self.client.result().ok_or("no lookup result")?;
@@ -332,13 +343,19 @@ impl Runtime {
     pub fn find_value(&mut self, key: [u8; 32]) -> Result<(Option<Vec<u8>>, Vec<(NodeID, SocketAddr)>), String> {
         let mut next = self.client.start_find_value(key, &self.routing);
 
-        let mut queries = 0;
-        while let Some((op, addr)) = next {
-            if queries > 2 {
-                break;
-            }
+        while let Some((ref op, addr)) = next {
             self.send_dht_op(&op, addr);
-            let (response, sender) = self.recv_dht(addr)?;
+            let (response, sender) = match self.recv_dht(addr) {
+                Ok((resp, send)) => (resp, send),
+                Err(_) => {
+                    let (maybe_next, done) = self.client.skip_node();
+                    if done {
+                        break;
+                    }
+                    next = maybe_next;
+                    continue;
+                },
+            };
             if let Some((_ping_id, ping_addr)) = self.routing.add_node(response.sender_id(), sender) {
                 let ping = DhtOperation::Ping { sender_id: self.id };
                 self.send_dht_op(&ping, ping_addr);
@@ -351,7 +368,6 @@ impl Runtime {
             }
 
             next = maybe_next;
-            queries += 1;
         }
 
         let result = self.client.result().ok_or("no lookup result")?;
@@ -395,7 +411,10 @@ impl Runtime {
         relay_id: u128,
         ttl: u32,
     ) -> Result<(), String> {
-        let contact = ContactRecord::new(device_list, relay_addr, relay_id);
+        let device_key = self.device_ed25519_priv
+            .as_ref()
+            .ok_or("device signing key not set")?;
+        let contact = ContactRecord::new(device_list, relay_addr, relay_id, device_key);
         let record = Record::new(RecordTag::Contact, contact.serialize());
         let master = self.master_pubkey
             .ok_or("master pubkey not set")?;
@@ -411,7 +430,11 @@ impl Runtime {
         if record.tag != RecordTag::Contact {
             return Err("unexpected record type".to_string());
         }
-        ContactRecord::from_serialized(record.data)
+        let contact = ContactRecord::from_serialized(record.data)?;
+        if !contact.verify() {
+            return Err("contact record signature invalid".to_string());
+        }
+        Ok(contact)
     }
 
     // pull from dht_pile until we get a response-type packet from the
