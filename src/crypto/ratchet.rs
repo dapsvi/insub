@@ -21,7 +21,12 @@ impl Chain {
         Ok((self.message_number, message_key))
     }
 
+    const MAX_SKIP: u32 = 2048;
+
     pub fn skip_to(&mut self, target: u32) -> Result<[u8; 32], String> {
+        if target - self.message_number > Self::MAX_SKIP {
+            return Err("message gap too large".to_string());
+        }
         let mut final_key = [0u8; 32];
         for msg_num in (self.message_number + 1)..=target {
             let msg_key = derive_key(&self.key, None, b"message-key")?;
@@ -56,12 +61,31 @@ fn kdf_rk(rk: [u8; 32], dh_out: [u8; 32]) -> ([u8; 32], [u8; 32]) {
 pub struct DoubleRatchet {
     root_key: [u8; 32],
     sending_chain: Chain,
-    receiving_chain: Chain,
+    receiving_chains: HashMap<[u8; 32], (Chain, u64)>, // (chain, last_used_timestamp)
     our_dh_priv: [u8; 32],
     their_dh_pub: [u8; 32],
 }
 
 impl DoubleRatchet {
+    fn update_receiving_chain_timestamp(&mut self, their_dh_pub: [u8; 32]) {
+        if let Some((_, timestamp)) = self.receiving_chains.get_mut(&their_dh_pub) {
+            *timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+        }
+    }
+
+    fn insert_receiving_chain(receiving_chains: &mut HashMap<[u8; 32], (Chain, u64)>, their_dh_pub: [u8; 32], chain_key: [u8; 32]) {
+        if receiving_chains.len() as u32 >= Self::MAX_SAVED_CHAINS {
+            // remove the oldest chain
+            if let Some(oldest_key) = receiving_chains.iter().min_by_key(|(_, (_, ts))| *ts).map(|(k, _)| *k) {
+                receiving_chains.remove(&oldest_key);
+            }
+        }
+        receiving_chains.insert(their_dh_pub, (Chain { key: chain_key, message_number: 0, skipped_keys: HashMap::new() }, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()));
+    }
+
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<(u32, Vec<u8>, [u8; 12], [u8; 32]), String> {
         let (message_number, message_key) = self.sending_chain.advance()?;
         let (ciphertext, nonce) = cipher::encrypt(plaintext, &message_key)?;
@@ -83,19 +107,27 @@ impl DoubleRatchet {
             self.dh_ratchet_step(their_dh_pub);
         }
 
-        let message_key = if message_number == self.receiving_chain.message_number + 1 {
-            let (_msg_num, message_key) = self.receiving_chain.advance()?;
+        self.update_receiving_chain_timestamp(their_dh_pub);
+        let (chain, _timestamp) = match self.receiving_chains.get_mut(&their_dh_pub) {
+            Some(c) => c,
+            None => return Err("No receiving chain for this DH pubkey".to_string()),
+        };
+
+        let message_key = if message_number == chain.message_number + 1 {
+            let (_msg_num, message_key) = chain.advance()?;
             message_key
-        } else if message_number > self.receiving_chain.message_number + 1 {
-            self.receiving_chain.skip_to(message_number)?
-        } else if self.receiving_chain.skipped_keys.contains_key(&message_number) {
-            self.receiving_chain.try_skipped(message_number).unwrap()
+        } else if message_number > chain.message_number + 1 {
+            chain.skip_to(message_number)?
+        } else if chain.skipped_keys.contains_key(&message_number) {
+            chain.try_skipped(message_number).unwrap()
         } else {
             return Err("Message number is too old".to_string());
         };
 
         cipher::decrypt(ciphertext, nonce, &message_key)
     }
+
+    const MAX_SAVED_CHAINS: u32 = 8;
 
     fn dh_ratchet_step(&mut self, their_new_dh_pub: [u8; 32]) {
         let their_pubkey = PublicKey::from(their_new_dh_pub);
@@ -111,7 +143,7 @@ impl DoubleRatchet {
         let (root_final, new_sending_chain_key) = kdf_rk(root_after_recv, *dh_send.as_bytes());
 
         self.root_key = root_final;
-        self.receiving_chain = Chain { key: new_receiving_chain_key, message_number: 0, skipped_keys: HashMap::new() };
+        Self::insert_receiving_chain(&mut self.receiving_chains, their_new_dh_pub, new_receiving_chain_key);
         self.sending_chain = Chain { key: new_sending_chain_key, message_number: 0, skipped_keys: HashMap::new() };
         self.our_dh_priv = *our_new_secret.as_bytes();
         self.their_dh_pub = their_new_dh_pub;
@@ -119,11 +151,13 @@ impl DoubleRatchet {
 
     pub fn new(shared_secret: [u8; 32], our_dh_priv: [u8; 32], their_dh_pub: [u8; 32]) -> Self {
         let initial_chain_key = derive_key(&shared_secret, None, b"init-chain").unwrap();
+        let mut receiving_chains = HashMap::new();
+        Self::insert_receiving_chain(&mut receiving_chains, their_dh_pub, initial_chain_key);
 
         DoubleRatchet {
             root_key: shared_secret,
             sending_chain: Chain { key: initial_chain_key, message_number: 0, skipped_keys: HashMap::new() },
-            receiving_chain: Chain { key: initial_chain_key, message_number: 0, skipped_keys: HashMap::new() },
+            receiving_chains,
             our_dh_priv,
             their_dh_pub,
         }
@@ -139,6 +173,6 @@ impl DoubleRatchet {
         self.root_key = new_root;
         self.sending_chain = Chain { key: new_sending_chain_key, message_number: 0, skipped_keys: HashMap::new() };
         self.our_dh_priv = *our_new_secret.as_bytes();
-        // their_dh_pub and receiving_chain are deliberately untouched
+        // their_dh_pub and receiving_chains are untouched
     }
 }

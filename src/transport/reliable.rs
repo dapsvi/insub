@@ -184,7 +184,7 @@ impl ReliableTransport {
                 data.extend_from_slice(&key.sign(&id.to_be_bytes()).to_bytes());
                 data
             }
-            None => vec![],
+            None => return,
         };
         let ack_flags = PacketFlags::from_int(flag_to_int(PacketFlag::Ack));
         let ack = Packet::new(
@@ -233,11 +233,6 @@ fn verify_ack(
     // only accept Acks from the address we sent to
     if entry.dest != sender {
         return false;
-    }
-
-    // unsigned Ack (backwards compat or no signing key configured)
-    if packet.payload.data.len() < 96 {
-        return true;
     }
 
     // signed Ack: pubkey (32) || signature (64)
